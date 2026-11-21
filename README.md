@@ -2,7 +2,7 @@
 
 Auto-synced from the `buildercomp` workspace by `scripts/sync_kleong.py`. It is an independent native Rust pipeline with no shared code with `candidates/rust` or Alex; its only dependency is `libc`.
 
-**Current source: iter 6 (`11dae9c`)**, the newest kept build: 20M wall median **1356.8 ms**, -30.5% vs Alex's 1952 ms on the same rig. Notes: delta_wall=-85.4ms (-5.92%) ci95=[-135.7,-75.3]ms; 60M 4199->3975ms (-224ms, int 3835ms, RSS 3920MB MATCH); clicks 220->147ms (-73ms, 60M -203ms), dedup 234->212ms (-22ms), RSS -243MB
+**Current source: iter 7 (`70c856a`)**, the newest kept build: 20M wall median **1281.6 ms**, -34.3% vs Alex's 1952 ms on the same rig. Notes: delta_wall=-96.4ms (-7.00%) ci95=[-101.5,-85.2]ms; 60M 3975->3768ms (-207ms, int 3618ms, RSS 3920->2811MB -1.1GB MATCH!); dedup 222->169ms (-53ms, 60M 794->631ms), links 102->75ms (-26ms), clicks 149->123ms (-26ms), solve 232->216ms (-16ms); events +26ms due to byte-by-byte ENC6 loop -> fix with SWAR+BMI2 pext next!
 
 Rejected experiments are kept under `patches/`. Older kept builds are in this directory's git history.
 
@@ -18,6 +18,8 @@ Rejected experiments are kept under `patches/`. Older kept builds are in this di
 | 5 | `1306817` | 1443.4 ms | WIN | hybrid shared ShardSet, parallel links init, KeyMap, ID/P_SHARDS=512 + ehash/prefetch dedup, direct Parquet Column emit + zero-copy write, zero-div solve + packed u64 Ev8 sort |
 | 6 | `11dae9c` | 1356.8 ms | WIN | reorder clicks after dedup for pre-faulted THP reuse, lock-free thread-local shared ShardSet carving, compact Ev8/Cl24 Resolver, keep parallel build_links & P_BITS=9 |
 | h1 | `e0a06a7` | 1405.0 ms | WIN | field:Dremix10 D1 two-pass fixed-schema tokenizer (events+clicks) |
+| 7 | `70c856a` | 1281.6 ms | WIN | 8-byte exact byte-ordered Key8 (6-bit [0-9A-Za-z_] + OverflowStore), shrinking RawEv 48->32B, PEv/Cl/LEnt/LSide/KeyMap by 33-50%, 64B L1 Scatter |
+| h1b | `32d1279` | 1322.5 ms | WIN | field:Dremix10 D1 two-pass tokenizer, rebased on iter6 |
 
 Alex `2d9954b2` on the same rig: 1952 ms at 20M, 5757 ms at 60M. Timing runs `docker run` with the scorer flags, timed from the container's `StartedAt` to `FinishedAt`, with paired AB/BA comparisons and a 95% confidence interval (`scripts/scorer_time.sh`). These numbers are **not** directly comparable to this repo's `research.benchmark` or AWS numbers; re-measure before promoting.
 

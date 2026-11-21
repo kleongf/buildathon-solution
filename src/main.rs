@@ -1,6 +1,6 @@
 //! Shopping Sessions pipeline.
 //!
-//! Stages: init (manifest, products, campaigns, mmaps) -> links (exact Key16
+//! Stages: init (manifest, products, campaigns, mmaps) -> links (exact Key8
 //! interning, lock-free union-find, LinkTable + Bloom) -> clicks (parse, validate,
 //! resolve person, scatter to person shards) -> events (parse, validate, scatter a
 //! compact RawEv to event_id shards) -> dedup (per event_id shard: exact dedup,
@@ -26,8 +26,8 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use arena::{ShardSet, Scatter, Segs};
-use key::Key16;
-use links::{prefetch, LinkTable, Resolver, SEED_A};
+use key::Key8;
+use links::{prefetch, Resolver, SEED_A};
 use parquet::{Column, Kind};
 use ts::{parse_price, parse_ts, DateCache, DAY_MS};
 
@@ -181,20 +181,20 @@ pub(crate) fn release_chunk(d: &[u8]) {
 }
 
 // ---------------------------------------------------------------------------
-// inline Key16 string maps (products, campaigns) — zero pointer chase to CSV
+// inline Key8 string maps (products, campaigns) — zero pointer chase to CSV
 
 struct KeyMap {
-    slots: Vec<(Key16, u32)>,
+    slots: Vec<(Key8, u32)>,
     mask: usize,
 }
 
 impl KeyMap {
     fn new(n: usize) -> KeyMap {
         let cap = (n * 2).next_power_of_two().max(16);
-        KeyMap { slots: vec![(Key16::EMPTY, u32::MAX); cap], mask: cap - 1 }
+        KeyMap { slots: vec![(Key8::EMPTY, u32::MAX); cap], mask: cap - 1 }
     }
     fn insert(&mut self, k: &[u8], v: u32) {
-        let key = Key16::new(k);
+        let key = Key8::new(k);
         let mut i = key.hash(SEED_MAP) as usize & self.mask;
         loop {
             let s = &mut self.slots[i];
@@ -210,7 +210,7 @@ impl KeyMap {
     }
     #[inline(always)]
     fn get(&self, k: &[u8]) -> Option<u32> {
-        let key = Key16::new(k);
+        let key = Key8::new(k);
         let mut i = key.hash(SEED_MAP) as usize & self.mask;
         loop {
             let s = unsafe { self.slots.get_unchecked(i) };
@@ -253,8 +253,8 @@ const INGEST_NONE: u32 = u32::MAX;
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct RawEv {
-    eid: Key16,
-    uid: Key16,
+    eid: Key8,
+    uid: Key8,
     ts: u32,
     price: u32,
     ingest: u32,
@@ -313,7 +313,7 @@ fn ingest_less_slow(a: u32, b: u32, base: i64, oob: &[i64]) -> bool {
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct PEv {
-    person: Key16,
+    person: Key8,
     ts: u32,
     pc: u32,
 }
@@ -322,8 +322,8 @@ struct PEv {
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Click {
-    person: Key16,
-    cid: Key16,
+    person: Key8,
+    cid: Key8,
     phash: u64,
     ts: u32,
     camp: u32,
@@ -353,16 +353,17 @@ impl Ev8 {
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Cl24 {
-    cid: Key16,
+    cid: Key8,
     ts: u32,
     camp: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<RawEv>() == 48);
-const _: () = assert!(std::mem::size_of::<PEv>() == 24);
-const _: () = assert!(std::mem::size_of::<Click>() == 48);
+const _: () = assert!(std::mem::size_of::<RawEv>() == 32);
+const _: () = assert!(std::mem::size_of::<PEv>() == 16);
+const _: () = assert!(std::mem::size_of::<Click>() == 32);
 const _: () = assert!(std::mem::size_of::<Ev8>() == 8);
-const _: () = assert!(std::mem::size_of::<Cl24>() == 24);
+const _: () = assert!(std::mem::size_of::<Cl24>() == 16);
+const _: () = assert!(arena::SEG / std::mem::size_of::<RawEv>() <= 512);
 
 struct Ctx {
     ws: i64,
@@ -555,7 +556,7 @@ impl<'a> Worker<'a> {
     }
 
     #[inline(always)]
-    fn flush_row(&mut self, person: Key16, day: u32, ns: u32, ne: u32, rev: u64) {
+    fn flush_row(&mut self, person: Key8, day: u32, ns: u32, ne: u32, rev: u64) {
         let mut top = -1i32;
         let mut best = 0u64;
         for &c in &self.touched {
@@ -597,7 +598,7 @@ impl<'a> Worker<'a> {
     }
 
     /// One person: events sorted by ts, clicks sorted by (ts, click_id).
-    fn person(&mut self, person: Key16, evs: &[Ev8], clicks: &[Cl24]) {
+    fn person(&mut self, person: Key8, evs: &[Ev8], clicks: &[Cl24]) {
         self.sess.clear();
         let day0ms = self.ctx.day0 * DAY_MS - self.ctx.base;
         let mut day_idx = 0u32;
@@ -823,7 +824,7 @@ fn sort_person_clicks(sl: &mut [Cl24], tmp: &mut Vec<Cl24>) {
 struct SolveScratch {
     ht: Vec<u32>,
     ht_mask: usize,
-    pkeys: Vec<Key16>,
+    pkeys: Vec<Key8>,
     ev_off: Vec<u32>,
     ev_cur: Vec<u32>,
     ev_pids: Vec<u32>,
@@ -862,7 +863,7 @@ impl SolveScratch {
     }
 
     #[inline(always)]
-    fn intern(&mut self, person: Key16) -> u32 {
+    fn intern(&mut self, person: Key8) -> u32 {
         // Grow if load > 50%
         if self.pkeys.len() * 2 >= self.ht.len() {
             self.grow_ht();
@@ -902,7 +903,7 @@ impl SolveScratch {
     }
 
     #[inline(always)]
-    fn lookup(&self, person: Key16, phash: u64) -> Option<u32> {
+    fn lookup(&self, person: Key8, phash: u64) -> Option<u32> {
         let mask = self.ht_mask;
         let mut i = phash as usize & mask;
         loop {
@@ -933,7 +934,7 @@ impl SolveScratch {
         self.ev_pids.clear();
         self.ev_pids.reserve(nev);
 
-        // Pass 1 over events: intern exact Key16 persons in L1/L2 hash table
+        // Pass 1 over events: intern exact Key8 persons in L1/L2 hash table
         for seg in es.iter() {
             for e in seg {
                 let pid = self.intern(e.person);
@@ -1180,12 +1181,12 @@ fn main() {
                     return;
                 }
                 let ingest = ctx.dates.parse_f1_ingest(f[3]);
-                let ek = Key16::new(eid);
+                let ek = Key8::new(eid);
                 let eh = ek.hash(SEED_ID);
                 let ing_u32 = enc_ingest_fast(ingest, ctx.base, oob_ref);
                 let mut r = RawEv {
                     eid: ek,
-                    uid: Key16::EMPTY,
+                    uid: Key8::EMPTY,
                     ts: TS_INVALID,
                     price: 0,
                     ingest: ing_u32,
@@ -1223,7 +1224,7 @@ fn main() {
                     if ing - ts > LATE_MS {
                         break 'v;
                     }
-                    r.uid = Key16::new(uid);
+                    r.uid = Key8::new(uid);
                     r.ts = (ts - ctx.base) as u32;
                     r.price = price_enc;
                 }
@@ -1244,7 +1245,7 @@ fn main() {
     par(threads, |_| {
         let mut w = Scatter::new(&ev_set);
         let mut res = Resolver::new(links, Ev8(0));
-        let mut emit = |e: Ev8, person: Key16, phash: u64| {
+        let mut emit = |e: Ev8, person: Key8, phash: u64| {
             w.push((phash >> (64 - P_BITS)) as usize, PEv { person, ts: e.ts(), pc: e.pc() });
         };
         let (mut t32, mut t64): (Vec<u32>, Vec<u64>) = (Vec::new(), Vec::new());
@@ -1291,9 +1292,9 @@ fn main() {
     let next = AtomicUsize::new(0);
     par(threads, |_| {
         let mut w = Scatter::new(&click_set);
-        let zero = Cl24 { cid: Key16::EMPTY, ts: 0, camp: 0 };
+        let zero = Cl24 { cid: Key8::EMPTY, ts: 0, camp: 0 };
         let mut res = Resolver::new(links, zero);
-        let mut emit = |c: Cl24, person: Key16, phash: u64| {
+        let mut emit = |c: Cl24, person: Key8, phash: u64| {
             w.push((phash >> (64 - P_BITS)) as usize, Click { person, cid: c.cid, phash, ts: c.ts, camp: c.camp });
         };
         loop {
@@ -1313,8 +1314,8 @@ fn main() {
                     Some(t) if t >= cws && t < ctx.we => t,
                     _ => return,
                 };
-                let c = Cl24 { cid: Key16::new(cid), ts: (ts - ctx.base) as u32, camp };
-                res.push(c, Key16::new(uid), &mut emit);
+                let c = Cl24 { cid: Key8::new(cid), ts: (ts - ctx.base) as u32, camp };
+                res.push(c, Key8::new(uid), &mut emit);
             });
             release_chunk(d);
         }

@@ -1,16 +1,16 @@
 //! Linked-ID resolution.
 //!
-//! `build_links` interns every linked ID exactly (`Key16`), joins components with a
+//! `build_links` interns every linked ID exactly (`Key8`), joins components with a
 //! lock-free union-find whose roots are always the byte-wise smallest ID, and stores
 //! only the IDs whose person differs from themselves in a compact `LinkTable`
-//! (exact `Key16` -> person `Key16`). A 2 MB blocked Bloom filter over those IDs
+//! (exact `Key8` -> person `Key8`). A 2 MB blocked Bloom filter over those IDs
 //! lets unlinked/root IDs skip the DRAM table probe, and `Resolver` adds a 64-entry
 //! direct-mapped per-thread cache (whale IDs) plus a prefetch delay ring.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::arena::{ShardSet, Scatter};
-use crate::key::Key16;
+use crate::key::Key8;
 use crate::{csv, make_chunks, chunk_target, par, populate, release_chunk, SyncPtr};
 
 pub const SEED_L: u64 = 0x9e37_79b9_7f4a_7c15;
@@ -18,18 +18,18 @@ pub const SEED_A: u64 = SEED_L;
 
 const REGION_BITS: u32 = 8;
 const REGIONS: usize = 1 << REGION_BITS;
-/// Link-side shards for interning (each holds at least one 2 MB block).
+/// Link-side shards for interning.
 const SIDE_BITS: u32 = 6;
 const SIDE_SHARDS: usize = 1 << SIDE_BITS;
 
 #[derive(Clone, Copy)]
-#[repr(C, align(32))]
+#[repr(C, align(16))]
 struct LEnt {
-    key: Key16,
-    person: Key16,
+    key: Key8,
+    person: Key8,
 }
 
-const LEMPTY: LEnt = LEnt { key: Key16::EMPTY, person: Key16::EMPTY };
+const LEMPTY: LEnt = LEnt { key: Key8::EMPTY, person: Key8::EMPTY };
 
 pub struct LinkTable {
     tab: Vec<LEnt>,
@@ -78,7 +78,7 @@ impl LinkTable {
 
     /// Person of `uid` if it is a linked, non-root ID.
     #[inline(always)]
-    pub fn lookup(&self, h: u64, uid: Key16) -> Option<Key16> {
+    pub fn lookup(&self, h: u64, uid: Key8) -> Option<Key8> {
         let rmask = (1usize << self.rbits) - 1;
         let base = ((h >> (64 - REGION_BITS)) as usize) << self.rbits;
         let mut i = h as usize & rmask;
@@ -87,7 +87,7 @@ impl LinkTable {
             if e.key == uid {
                 return Some(e.person);
             }
-            if e.key.lo == 0 {
+            if e.key.is_empty() {
                 return None;
             }
             i = (i + 1) & rmask;
@@ -95,7 +95,7 @@ impl LinkTable {
     }
 
     #[cfg(test)]
-    pub fn resolve(&self, uid: Key16) -> Key16 {
+    pub fn resolve(&self, uid: Key8) -> Key8 {
         let h = uid.hash(SEED_L);
         if !self.maybe(h) {
             return uid;
@@ -109,8 +109,8 @@ impl LinkTable {
 
 #[derive(Clone, Copy)]
 struct CEnt {
-    uid: Key16,
-    person: Key16,
+    uid: Key8,
+    person: Key8,
     phash: u64,
 }
 
@@ -120,7 +120,7 @@ const RA: usize = 8;
 /// Items between the table-slot prefetch and the table probe.
 const RB: usize = 16;
 
-type Item<R> = (R, Key16, u64);
+type Item<R> = (R, Key8, u64);
 
 /// Two-stage software pipeline: push -> (cache hit: emit) -> prefetch Bloom word ->
 /// RA items later: Bloom test (negative: emit uid itself) -> prefetch table slot ->
@@ -140,11 +140,11 @@ impl<'a, R: Copy> Resolver<'a, R> {
     pub fn new(lt: &'a LinkTable, zero: R) -> Self {
         Resolver {
             lt,
-            cache: [CEnt { uid: Key16::EMPTY, person: Key16::EMPTY, phash: 0 }; CACHE],
-            a: [(zero, Key16::EMPTY, 0); RA],
+            cache: [CEnt { uid: Key8::EMPTY, person: Key8::EMPTY, phash: 0 }; CACHE],
+            a: [(zero, Key8::EMPTY, 0); RA],
             ah: 0,
             at: 0,
-            b: [(zero, Key16::EMPTY, 0); RB],
+            b: [(zero, Key8::EMPTY, 0); RB],
             bh: 0,
             bt: 0,
         }
@@ -152,7 +152,7 @@ impl<'a, R: Copy> Resolver<'a, R> {
 
     /// Resolves `uid` to (person, person hash) and eventually calls `emit` for it.
     #[inline(always)]
-    pub fn push(&mut self, item: R, uid: Key16, emit: &mut impl FnMut(R, Key16, u64)) {
+    pub fn push(&mut self, item: R, uid: Key8, emit: &mut impl FnMut(R, Key8, u64)) {
         let h = uid.hash(SEED_L);
         let c = unsafe { self.cache.get_unchecked((h as usize) & (CACHE - 1)) };
         if c.uid == uid {
@@ -170,7 +170,7 @@ impl<'a, R: Copy> Resolver<'a, R> {
     }
 
     #[inline(always)]
-    fn stage_b(&mut self, x: Item<R>, emit: &mut impl FnMut(R, Key16, u64)) {
+    fn stage_b(&mut self, x: Item<R>, emit: &mut impl FnMut(R, Key8, u64)) {
         let (item, uid, h) = x;
         if !self.lt.maybe(h) {
             self.cache[(h as usize) & (CACHE - 1)] = CEnt { uid, person: uid, phash: h };
@@ -188,7 +188,7 @@ impl<'a, R: Copy> Resolver<'a, R> {
     }
 
     #[inline(always)]
-    fn finish_one(&mut self, y: Item<R>, emit: &mut impl FnMut(R, Key16, u64)) {
+    fn finish_one(&mut self, y: Item<R>, emit: &mut impl FnMut(R, Key8, u64)) {
         let (item, uid, h) = y;
         let (person, phash) = match self.lt.lookup(h, uid) {
             Some(p) => (p, p.hash(SEED_A)),
@@ -198,7 +198,7 @@ impl<'a, R: Copy> Resolver<'a, R> {
         emit(item, person, phash);
     }
 
-    pub fn drain(&mut self, emit: &mut impl FnMut(R, Key16, u64)) {
+    pub fn drain(&mut self, emit: &mut impl FnMut(R, Key8, u64)) {
         while self.ah < self.at {
             let x = self.a[self.ah % RA];
             self.ah += 1;
@@ -219,7 +219,7 @@ impl<'a, R: Copy> Resolver<'a, R> {
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct LSide {
-    key: Key16,
+    key: Key8,
     ep: u64, // thread << 40 | endpoint slot
 }
 
@@ -244,7 +244,7 @@ pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
                     return;
                 }
                 for (side, k) in [a, b].into_iter().enumerate() {
-                    let key = Key16::new(k);
+                    let key = Key8::new(k);
                     let s = (key.hash(SEED_L) >> (64 - SIDE_BITS)) as usize;
                     w.push(s, LSide { key, ep: ((t as u64) << 40) | (ne * 2 + side as u64) });
                 }
@@ -268,7 +268,7 @@ pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
         .collect();
     let ep_ptrs: Vec<SyncPtr> = eps.iter_mut().map(|v| SyncPtr(v.as_mut_ptr())).collect();
     let next = AtomicUsize::new(0);
-    let shard_keys: Vec<Vec<(usize, Vec<Key16>)>> = par(threads, |_| {
+    let shard_keys: Vec<Vec<(usize, Vec<Key8>)>> = par(threads, |_| {
         let mut res = Vec::new();
         let mut tab: Vec<u32> = Vec::new();
         loop {
@@ -282,7 +282,7 @@ pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
             let mask = cap - 1;
             tab.clear();
             tab.resize(cap, 0);
-            let mut keys: Vec<Key16> = Vec::new();
+            let mut keys: Vec<Key8> = Vec::new();
             for seg in segs.iter() {
                 for side in seg {
                     let mut i = side.key.hash(SEED_L) as usize & mask;
@@ -311,7 +311,7 @@ pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
         res
     });
     sides.free_all();
-    let mut per_shard: Vec<Vec<Key16>> = (0..SIDE_SHARDS).map(|_| Vec::new()).collect();
+    let mut per_shard: Vec<Vec<Key8>> = (0..SIDE_SHARDS).map(|_| Vec::new()).collect();
     for (s, k) in shard_keys.into_iter().flatten() {
         per_shard[s] = k;
     }
@@ -320,7 +320,7 @@ pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
         base[s + 1] = base[s] + per_shard[s].len() as u32;
     }
     let n = base[SIDE_SHARDS] as usize;
-    let mut keys: Vec<Key16> = Vec::with_capacity(n);
+    let mut keys: Vec<Key8> = Vec::with_capacity(n);
     unsafe { keys.set_len(n) };
     let mut parent: Vec<AtomicU32> = Vec::with_capacity(n);
     unsafe { parent.set_len(n) };
@@ -333,7 +333,7 @@ pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
         let base = &base;
         let step_s = SIDE_SHARDS.div_ceil(threads).max(1);
         par(threads, |t| {
-            let kdst = kp.0 as *mut Key16;
+            let kdst = kp.0 as *mut Key8;
             let pdst = pp.0 as *mut AtomicU32;
             for s in (t * step_s).min(SIDE_SHARDS)..((t + 1) * step_s).min(SIDE_SHARDS) {
                 let b = base[s] as usize;
@@ -457,7 +457,7 @@ pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
                     bloom[bloom_word(h, bloom_mask)].fetch_or(bloom_bits(h), Ordering::Relaxed);
                     let mut i = h as usize & rmask;
                     unsafe {
-                        while (*tab.add((r << rbits) + i)).key.lo != 0 {
+                        while !(*tab.add((r << rbits) + i)).key.is_empty() {
                             i = (i + 1) & rmask;
                         }
                         *tab.add((r << rbits) + i) = LEnt { key, person: keys[root] };
@@ -477,7 +477,7 @@ pub fn build_links_single(files: &[&'static [u8]]) -> LinkTable {
     let mut cap = (est * 2).next_power_of_two().max(256);
     let mut tab: Vec<u32> = vec![0; cap];
     let mut mask = cap - 1;
-    let mut keys: Vec<Key16> = Vec::with_capacity(est);
+    let mut keys: Vec<Key8> = Vec::with_capacity(est);
     let mut parent: Vec<u32> = Vec::with_capacity(est);
 
     #[inline(always)]
@@ -494,7 +494,7 @@ pub fn build_links_single(files: &[&'static [u8]]) -> LinkTable {
     }
 
     #[cold]
-    fn grow(tab: &mut Vec<u32>, cap: &mut usize, mask: &mut usize, keys: &[Key16]) {
+    fn grow(tab: &mut Vec<u32>, cap: &mut usize, mask: &mut usize, keys: &[Key8]) {
         *cap *= 2;
         *mask = *cap - 1;
         tab.clear();
@@ -524,7 +524,7 @@ pub fn build_links_single(files: &[&'static [u8]]) -> LinkTable {
             if fa.is_empty() || fb.is_empty() {
                 return;
             }
-            let mut intern = |k: Key16| -> u32 {
+            let mut intern = |k: Key8| -> u32 {
                 if keys.len() * 2 >= cap {
                     grow(&mut tab, &mut cap, &mut mask, &keys);
                 }
@@ -545,8 +545,8 @@ pub fn build_links_single(files: &[&'static [u8]]) -> LinkTable {
                     i = (i + 1) & mask;
                 }
             };
-            let ia = intern(Key16::new(fa));
-            let ib = intern(Key16::new(fb));
+            let ia = intern(Key8::new(fa));
+            let ib = intern(Key8::new(fb));
             let a = find_seq(&mut parent, ia);
             let b = find_seq(&mut parent, ib);
             if a != b {
@@ -599,7 +599,7 @@ pub fn build_links_single(files: &[&'static [u8]]) -> LinkTable {
             let r = (h >> (64 - REGION_BITS)) as usize;
             let base = r << rbits;
             let mut i = h as usize & rmask;
-            while (*lptr.add(base + i)).key.lo != 0 {
+            while !(*lptr.add(base + i)).key.is_empty() {
                 i = (i + 1) & rmask;
             }
             *lptr.add(base + i) = LEnt {
@@ -638,15 +638,15 @@ mod tests {
         for mode in [0usize, 1, 4] {
             let lt = if mode == 0 { build_links_single(&[data]) } else { build_links(&[data], mode) };
             for i in 0..1000 {
-                assert_eq!(lt.resolve(Key16::new(format!("n{i:04}").as_bytes())), Key16::new(b"n0000"));
+                assert_eq!(lt.resolve(Key8::new(format!("n{i:04}").as_bytes())), Key8::new(b"n0000"));
             }
-            assert_eq!(lt.resolve(Key16::new(b"a\0b")), Key16::new(b"a\0"));
-            assert_eq!(lt.resolve(Key16::new(b"b")), Key16::new(b"a\0\0"));
-            assert_eq!(lt.resolve(Key16::new(b"a")), Key16::new(b"a"));
-            assert_eq!(lt.resolve(Key16::new(long_a.as_bytes())), Key16::new(long_b.as_bytes()));
-            assert_eq!(lt.resolve(Key16::new(b"M")), Key16::new(long_b.as_bytes()));
-            assert_eq!(lt.resolve(Key16::new(b"q")), Key16::new(b"q"));
-            assert_eq!(lt.resolve(Key16::new(b"unlinked")), Key16::new(b"unlinked"));
+            assert_eq!(lt.resolve(Key8::new(b"a\0b")), Key8::new(b"a\0"));
+            assert_eq!(lt.resolve(Key8::new(b"b")), Key8::new(b"a\0\0"));
+            assert_eq!(lt.resolve(Key8::new(b"a")), Key8::new(b"a"));
+            assert_eq!(lt.resolve(Key8::new(long_a.as_bytes())), Key8::new(long_b.as_bytes()));
+            assert_eq!(lt.resolve(Key8::new(b"M")), Key8::new(long_b.as_bytes()));
+            assert_eq!(lt.resolve(Key8::new(b"q")), Key8::new(b"q"));
+            assert_eq!(lt.resolve(Key8::new(b"unlinked")), Key8::new(b"unlinked"));
         }
     }
 }
