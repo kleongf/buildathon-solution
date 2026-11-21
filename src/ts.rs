@@ -224,7 +224,7 @@ impl DateCache {
             if ((non_digit_bits(d0) | non_digit_bits(d1)) & 0xF0) == 0 && d < 32 {
                 let slot = *self.slots.get_unchecked(d);
                 let pref = (p as *const u64).read_unaligned();
-                if pref == slot.prefix
+                if slot.prefix != 0 && pref == slot.prefix
                     && ((*p.add(10) ^ b'T') | (*p.add(13) ^ b':') | (*p.add(16) ^ b':')) == 0
                 {
                     let h0 = (*p.add(11)).wrapping_sub(b'0');
@@ -478,6 +478,18 @@ fn parse_price_slow(b: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn empty_date_slots_reject_nul_prefixes() {
+        let cache = DateCache::new(0, 14 * DAY_MS);
+        for day in 0..=31 {
+            for zone in ["Z", "+00:00"] {
+                let text = format!("{}{day:02}T00:00:00{zone}", "\0".repeat(8));
+                assert_eq!(cache.parse_ts(text.as_bytes()), None);
+            }
+        }
+        assert_eq!(cache.parse_ts(b"1970-01-01T00:00:00Z"), Some(0));
+    }
+
     #[test]
     fn forms_and_lut_edges() {
         // Exhaustively verify non_digit_bits for all 256 u8 values

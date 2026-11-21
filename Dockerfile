@@ -1,18 +1,12 @@
 # Shopping Sessions: native Rust pipeline.
-# The scorer builds this natively on linux/amd64 (Intel Xeon, Cascade Lake or
-# newer). No FROM line pins a platform, so it also builds natively on arm64.
+# The baseline follows the build architecture. The CSV scanner selects SIMD at runtime.
 
 FROM rust:1.85-slim-bookworm AS build
-ARG TARGETARCH
+ARG RUSTFLAGS=""
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-# x86-64-v3 (AVX2/BMI1/BMI2/LZCNT/POPCNT) is available on every Haswell-or-newer
-# Xeon, including all scorer CPUs. AVX-512 is never required.
-RUN if [ "$TARGETARCH" = "amd64" ] || [ "$(uname -m)" = "x86_64" ]; then \
-        export RUSTFLAGS="-C target-cpu=x86-64-v3"; \
-    fi; \
-    cargo build --release --locked \
+RUN cargo build --release --locked \
     && strip target/release/shopping-sessions \
     && cp target/release/shopping-sessions /shopping-sessions
 
