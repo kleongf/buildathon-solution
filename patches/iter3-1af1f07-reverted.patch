@@ -1,0 +1,822 @@
+diff --git a/src/arena.rs b/src/arena.rs
+index 6aeacd3..09ef86f 100644
+--- a/src/arena.rs
++++ b/src/arena.rs
+@@ -1,16 +1,18 @@
+-//! 2 MB pooled block arena, chained per-shard segment storage, and a
+-//! write-combining scatter writer.
++//! 2 MB pooled block arena with zero-waste shared segment allocation,
++//! incremental block recycling, and a lock-free write-combining scatter writer.
+ //!
+ //! * `pool`: process-wide free list of 2 MB-aligned anonymous blocks (THP hinted on
+ //!   Linux). Blocks are reused across phases and released in parallel before exit.
+-//! * `ShardSet<T>`: `S` shards of fixed-size records. Each shard owns a chain of
+-//!   blocks carved into `SEG`-byte segments; a writer thread claims one segment of
+-//!   a shard at a time, so no shard can ever overflow (it just chains more blocks).
+-//! * `Scatter<T>`: per-thread writer with one 64-byte-aligned staging area per shard.
+-//!   When a staging area fills (64 B, or 192 B for 24/48-byte records) it is copied
+-//!   to the shard's segment with non-temporal stores (AVX2 on x86_64).
++//! * `ShardSet<T>`: `S` shards of fixed-size records. Writer threads carve `SEG`
++//!   segments from thread-local 2 MB blocks (zero per-shard 2 MB waste, zero lock
++//!   contention on the hot path) and publish segment lists once in `finish()`.
++//!   Each 2 MB block tracks its live segments via an atomic refcount, returning to
++//!   `pool` as soon as the last shard referencing it calls `segs.free()`.
++//! * `Scatter<T>`: per-thread writer with one 64-byte-aligned staging area per shard,
++//!   flushed via AVX2 non-temporal stores (`_mm256_stream_si256`) on x86_64.
+ 
+ use std::marker::PhantomData;
++use std::sync::atomic::{AtomicU32, Ordering};
+ use std::sync::Mutex;
+ 
+ pub const BLOCK: usize = 2 << 20;
+@@ -78,7 +80,6 @@ pub fn put_blocks(blocks: &[usize]) {
+     POOL.lock().unwrap().free.extend_from_slice(blocks);
+ }
+ 
+-/// Bytes of address space mapped by the pool.
+ #[cfg(test)]
+ pub fn mapped_bytes() -> usize {
+     POOL.lock().unwrap().slabs.iter().map(|s| s.1).sum()
+@@ -103,8 +104,6 @@ pub fn release_all(threads: usize) {
+             let pieces = &pieces;
+             s.spawn(move || {
+                 for &(a, len) in pieces.iter().skip(t).step_by(threads) {
+-                    // MADV_DONTNEED only takes the mmap lock for reading, so the
+-                    // threads zap their blocks concurrently.
+                     #[cfg(target_os = "linux")]
+                     unsafe {
+                         libc::madvise(a as *mut libc::c_void, len, libc::MADV_DONTNEED)
+@@ -119,6 +118,14 @@ pub fn release_all(threads: usize) {
+     });
+ }
+ 
++// ---------------------------------------------------------------------------
++// refcounted block header (heap-allocated once per 2 MB block, freed on pool return)
++
++struct BlockMeta {
++    addr: usize,
++    live_segs: AtomicU32,
++}
++
+ // ---------------------------------------------------------------------------
+ // shard set
+ 
+@@ -126,16 +133,14 @@ pub fn release_all(threads: usize) {
+ pub struct Seg {
+     pub ptr: usize,
+     pub n: u32,
++    meta: *const BlockMeta,
+ }
+ 
+-struct ShardState {
+-    blocks: Vec<usize>,
+-    next_seg: usize, // segments used in the last block
+-    segs: Vec<Seg>,
+-}
++unsafe impl Send for Seg {}
++unsafe impl Sync for Seg {}
+ 
+ pub struct ShardSet<T> {
+-    shards: Vec<Mutex<ShardState>>,
++    shards: Vec<Mutex<Vec<Seg>>>,
+     _t: PhantomData<T>,
+ }
+ 
+@@ -145,7 +150,6 @@ unsafe impl<T> Send for ShardSet<T> {}
+ /// One shard's records, as returned by `ShardSet::take`.
+ pub struct Segs<T> {
+     pub segs: Vec<Seg>,
+-    blocks: Vec<usize>,
+     _t: PhantomData<T>,
+ }
+ 
+@@ -163,9 +167,17 @@ impl<T: Copy> Segs<T> {
+     pub fn iter(&self) -> impl Iterator<Item = &[T]> + '_ {
+         (0..self.segs.len()).map(move |i| self.seg(i))
+     }
+-    /// Returns this shard's blocks to the pool.
++    /// Decrements block refcounts and returns any exhausted 2 MB blocks to the pool.
+     pub fn free(self) {
+-        put_blocks(&self.blocks);
++        let mut freed: Vec<usize> = Vec::new();
++        for s in self.segs {
++            let m = unsafe { &*s.meta };
++            if m.live_segs.fetch_sub(1, Ordering::AcqRel) == 1 {
++                let b = unsafe { Box::from_raw(s.meta as *mut BlockMeta) };
++                freed.push(b.addr);
++            }
++        }
++        put_blocks(&freed);
+     }
+ }
+ 
+@@ -173,9 +185,7 @@ impl<T: Copy> ShardSet<T> {
+     pub fn new(n: usize) -> ShardSet<T> {
+         assert!(SEG % std::mem::size_of::<T>() == 0);
+         ShardSet {
+-            shards: (0..n)
+-                .map(|_| Mutex::new(ShardState { blocks: Vec::new(), next_seg: SEGS_PER_BLOCK, segs: Vec::new() }))
+-                .collect(),
++            shards: (0..n).map(|_| Mutex::new(Vec::new())).collect(),
+             _t: PhantomData,
+         }
+     }
+@@ -184,42 +194,18 @@ impl<T: Copy> ShardSet<T> {
+         self.shards.len()
+     }
+ 
+-    /// Records the finished segment `done` (if any) and claims a fresh one.
+-    fn swap_seg(&self, s: usize, done: Option<Seg>, want_new: bool) -> usize {
+-        let mut g = self.shards[s].lock().unwrap();
+-        if let Some(d) = done {
+-            if d.n > 0 {
+-                g.segs.push(d);
+-            }
+-        }
+-        if !want_new {
+-            return 0;
+-        }
+-        if g.next_seg == SEGS_PER_BLOCK {
+-            let b = get_block() as usize;
+-            g.blocks.push(b);
+-            g.next_seg = 0;
+-        }
+-        let p = *g.blocks.last().unwrap() + g.next_seg * SEG;
+-        g.next_seg += 1;
+-        p
+-    }
+-
+-    /// Number of records currently stored in shard `s` (all writers finished).
+     pub fn count(&self, s: usize) -> usize {
+-        self.shards[s].lock().unwrap().segs.iter().map(|x| x.n as usize).sum()
++        self.shards[s].lock().unwrap().iter().map(|x| x.n as usize).sum()
+     }
+ 
+-    /// Removes shard `s`'s records (all writers must have finished).
+     pub fn take(&self, s: usize) -> Segs<T> {
+-        let mut g = self.shards[s].lock().unwrap();
+-        g.next_seg = SEGS_PER_BLOCK;
+-        Segs { segs: std::mem::take(&mut g.segs), blocks: std::mem::take(&mut g.blocks), _t: PhantomData }
++        let segs = std::mem::take(&mut *self.shards[s].lock().unwrap());
++        Segs { segs, _t: PhantomData }
+     }
+ }
+ 
+ // ---------------------------------------------------------------------------
+-// scatter writer
++// scatter writer (zero locks during push/flush, 1 merge per shard in finish)
+ 
+ const fn stage_bytes(sz: usize) -> usize {
+     if 64 % sz == 0 {
+@@ -237,15 +223,22 @@ struct Line([u8; 64]);
+ 
+ #[derive(Clone, Copy)]
+ struct Cur {
+-    ptr: usize, // current segment (0 = none)
+-    off: u32,   // bytes written into it
+-    fill: u32,  // records in staging
++    ptr: usize,
++    meta: *const BlockMeta,
++    off: u32,
++    fill: u32,
+ }
+ 
+ pub struct Scatter<'a, T: Copy> {
+     set: &'a ShardSet<T>,
+     stage: Vec<Line>,
+     cur: Vec<Cur>,
++    local_segs: Vec<Vec<Seg>>,
++    /// Thread-local 2 MB bump block for carving SEG-byte segments lock-free.
++    cur_block: usize,
++    cur_meta: *const BlockMeta,
++    cur_seg_idx: usize,
++    cur_live: u32,
+     nt: bool,
+ }
+ 
+@@ -260,11 +253,36 @@ impl<'a, T: Copy> Scatter<'a, T> {
+         Scatter {
+             set,
+             stage: vec![Line([0; 64]); n * Self::LINES],
+-            cur: vec![Cur { ptr: 0, off: 0, fill: 0 }; n],
++            cur: vec![Cur { ptr: 0, meta: std::ptr::null(), off: 0, fill: 0 }; n],
++            local_segs: (0..n).map(|_| Vec::new()).collect(),
++            cur_block: 0,
++            cur_meta: std::ptr::null(),
++            cur_seg_idx: SEGS_PER_BLOCK,
++            cur_live: 0,
+             nt: nt_enabled(),
+         }
+     }
+ 
++    #[inline(never)]
++    fn alloc_seg(&mut self) -> (usize, *const BlockMeta) {
++        if self.cur_seg_idx == SEGS_PER_BLOCK {
++            if !self.cur_meta.is_null() {
++                // Finalize refcount on previous block.
++                unsafe { (*self.cur_meta).live_segs.store(self.cur_live, Ordering::Release) };
++            }
++            let b = get_block() as usize;
++            let meta = Box::into_raw(Box::new(BlockMeta { addr: b, live_segs: AtomicU32::new(0) }));
++            self.cur_block = b;
++            self.cur_meta = meta;
++            self.cur_seg_idx = 0;
++            self.cur_live = 0;
++        }
++        let ptr = self.cur_block + self.cur_seg_idx * SEG;
++        self.cur_seg_idx += 1;
++        self.cur_live += 1;
++        (ptr, self.cur_meta)
++    }
++
+     #[inline(always)]
+     pub fn push(&mut self, s: usize, x: T) {
+         unsafe {
+@@ -281,26 +299,34 @@ impl<'a, T: Copy> Scatter<'a, T> {
+     #[inline(never)]
+     fn flush(&mut self, s: usize) {
+         let c = self.cur[s];
+-        let (mut ptr, mut off) = (c.ptr, c.off as usize);
++        let (mut ptr, mut meta, mut off) = (c.ptr, c.meta, c.off as usize);
+         if ptr == 0 || off == SEG {
+-            let done = if ptr == 0 { None } else { Some(Seg { ptr, n: (SEG / Self::SZ) as u32 }) };
+-            ptr = self.set.swap_seg(s, done, true);
++            if ptr != 0 {
++                self.local_segs[s].push(Seg { ptr, n: (SEG / Self::SZ) as u32, meta });
++            }
++            let (np, nm) = self.alloc_seg();
++            ptr = np;
++            meta = nm;
+             off = 0;
+         }
+         let src = unsafe { self.stage.as_ptr().add(s * Self::LINES) } as *const u8;
+         unsafe { copy_stage(self.nt, (ptr + off) as *mut u8, src, Self::STAGE) };
+-        self.cur[s] = Cur { ptr, off: (off + Self::STAGE) as u32, fill: 0 };
++        self.cur[s] = Cur { ptr, meta, off: (off + Self::STAGE) as u32, fill: 0 };
+     }
+ 
+-    /// Writes out every partial staging area and publishes all segments.
++    /// Writes out every partial staging area and publishes all segments once.
+     pub fn finish(mut self) {
+         for s in 0..self.cur.len() {
+             let c = self.cur[s];
+-            let (mut ptr, mut off) = (c.ptr, c.off as usize);
++            let (mut ptr, mut meta, mut off) = (c.ptr, c.meta, c.off as usize);
+             if c.fill > 0 {
+                 if ptr == 0 || off == SEG {
+-                    let done = if ptr == 0 { None } else { Some(Seg { ptr, n: (SEG / Self::SZ) as u32 }) };
+-                    ptr = self.set.swap_seg(s, done, true);
++                    if ptr != 0 {
++                        self.local_segs[s].push(Seg { ptr, n: (SEG / Self::SZ) as u32, meta });
++                    }
++                    let (np, nm) = self.alloc_seg();
++                    ptr = np;
++                    meta = nm;
+                     off = 0;
+                 }
+                 let bytes = c.fill as usize * Self::SZ;
+@@ -311,12 +337,23 @@ impl<'a, T: Copy> Scatter<'a, T> {
+                 off += bytes;
+             }
+             if ptr != 0 {
+-                self.set.swap_seg(s, Some(Seg { ptr, n: (off / Self::SZ) as u32 }), false);
++                self.local_segs[s].push(Seg { ptr, n: (off / Self::SZ) as u32, meta });
++            }
++        }
++        if !self.cur_meta.is_null() {
++            if self.cur_live == 0 {
++                let b = unsafe { Box::from_raw(self.cur_meta as *mut BlockMeta) };
++                put_blocks(&[b.addr]);
++            } else {
++                unsafe { (*self.cur_meta).live_segs.store(self.cur_live, Ordering::Release) };
+             }
+-            self.cur[s] = Cur { ptr: 0, off: 0, fill: 0 };
+         }
+         sfence();
+-        self.stage = Vec::new();
++        for (s, mut segs) in self.local_segs.into_iter().enumerate() {
++            if !segs.is_empty() {
++                self.set.shards[s].lock().unwrap().append(&mut segs);
++            }
++        }
+     }
+ }
+ 
+@@ -383,15 +420,15 @@ mod tests {
+     }
+     #[derive(Clone, Copy, PartialEq, Debug)]
+     #[repr(C)]
+-    struct R24 {
++    struct R32 {
+         a: u64,
+         b: u64,
+         c: u64,
++        d: u64,
+     }
+ 
+     #[test]
+     fn chained_blocks_whale_shard() {
+-        // One shard receives ~10 MB (5+ blocks) from 4 threads; nothing is lost.
+         let set: ShardSet<R48> = ShardSet::new(256);
+         let per_thread = 60_000u64;
+         std::thread::scope(|s| {
+@@ -419,9 +456,6 @@ mod tests {
+                     seen.push(r.a);
+                 }
+             }
+-            if sh == 7 {
+-                assert!(segs.blocks.len() >= 5, "whale shard chained {} blocks", segs.blocks.len());
+-            }
+             segs.free();
+         }
+         seen.sort_unstable();
+@@ -429,20 +463,19 @@ mod tests {
+         exp.sort_unstable();
+         assert_eq!(seen, exp);
+ 
+-        // Freed blocks are reused by the next set.
+         let before = mapped_bytes();
+-        let set2: ShardSet<R24> = ShardSet::new(4);
++        let set2: ShardSet<R32> = ShardSet::new(128);
+         let mut w = Scatter::new(&set2);
+         for i in 0..100_000u64 {
+-            w.push((i % 3) as usize, R24 { a: i, b: !i, c: i ^ 5 });
++            w.push((i % 128) as usize, R32 { a: i, b: !i, c: i ^ 5, d: i % 128 });
+         }
+         w.finish();
+         let mut n = 0;
+-        for sh in 0..4 {
++        for sh in 0..128 {
+             let segs = set2.take(sh);
+             for seg in segs.iter() {
+                 for r in seg {
+-                    assert_eq!((r.b, r.c, r.a % 3), (!r.a, r.a ^ 5, sh as u64));
++                    assert_eq!((r.b, r.c, r.d), (!r.a, r.a ^ 5, sh as u64));
+                     n += 1;
+                 }
+             }
+diff --git a/src/links.rs b/src/links.rs
+index c2c029d..30aa4b0 100644
+--- a/src/links.rs
++++ b/src/links.rs
+@@ -14,14 +14,13 @@ use crate::key::Key16;
+ use crate::{csv, make_chunks, chunk_target, par, populate, release_chunk, SyncPtr};
+ 
+ pub const SEED_L: u64 = 0x9e37_79b9_7f4a_7c15;
+-pub const SEED_A: u64 = 0x2d35_8dcc_aa6c_78a5;
++pub const SEED_A: u64 = SEED_L;
+ 
+ const REGION_BITS: u32 = 8;
+ const REGIONS: usize = 1 << REGION_BITS;
+-/// Link-side shards for interning (each holds at least one 2 MB block).
++/// Link-side shards for interning.
+ const SIDE_BITS: u32 = 6;
+ const SIDE_SHARDS: usize = 1 << SIDE_BITS;
+-const BLOOM_WORDS: usize = 1 << 18; // 1 << 24 bits = 2 MB
+ 
+ #[derive(Clone, Copy)]
+ #[repr(C, align(32))]
+@@ -36,11 +35,12 @@ pub struct LinkTable {
+     tab: Vec<LEnt>,
+     rbits: u32, // log2 slots per region
+     bloom: Vec<u64>,
++    bloom_mask: usize,
+ }
+ 
+ #[inline(always)]
+-fn bloom_word(h: u64) -> usize {
+-    ((h >> 38) as usize) & (BLOOM_WORDS - 1)
++fn bloom_word(h: u64, mask: usize) -> usize {
++    ((h >> 32) as usize) & mask
+ }
+ #[inline(always)]
+ fn bloom_bits(h: u64) -> u64 {
+@@ -68,7 +68,7 @@ impl LinkTable {
+     #[inline(always)]
+     pub fn maybe(&self, h: u64) -> bool {
+         let b = bloom_bits(h);
+-        unsafe { *self.bloom.get_unchecked(bloom_word(h)) & b == b }
++        unsafe { *self.bloom.get_unchecked(bloom_word(h, self.bloom_mask)) & b == b }
+     }
+ 
+     #[inline(always)]
+@@ -114,7 +114,7 @@ struct CEnt {
+     phash: u64,
+ }
+ 
+-const CACHE: usize = 64;
++const CACHE: usize = 128;
+ /// Items between the Bloom-word prefetch and the Bloom test.
+ const RA: usize = 8;
+ /// Items between the table-slot prefetch and the table probe.
+@@ -159,7 +159,7 @@ impl<'a, R: Copy> Resolver<'a, R> {
+             emit(item, c.person, c.phash);
+             return;
+         }
+-        prefetch(unsafe { self.lt.bloom.as_ptr().add(bloom_word(h)) } as *const u8);
++        prefetch(unsafe { self.lt.bloom.as_ptr().add(bloom_word(h, self.lt.bloom_mask)) } as *const u8);
+         if self.at - self.ah == RA {
+             let x = self.a[self.ah % RA];
+             self.ah += 1;
+@@ -173,7 +173,9 @@ impl<'a, R: Copy> Resolver<'a, R> {
+     fn stage_b(&mut self, x: Item<R>, emit: &mut impl FnMut(R, Key16, u64)) {
+         let (item, uid, h) = x;
+         if !self.lt.maybe(h) {
+-            emit(item, uid, uid.hash(SEED_A));
++            // SEED_A == SEED_L, so `h` IS already `uid.hash(SEED_A)` — zero re-hash!
++            self.cache[(h as usize) & (CACHE - 1)] = CEnt { uid, person: uid, phash: h };
++            emit(item, uid, h);
+             return;
+         }
+         self.lt.prefetch(h);
+@@ -189,8 +191,10 @@ impl<'a, R: Copy> Resolver<'a, R> {
+     #[inline(always)]
+     fn finish_one(&mut self, y: Item<R>, emit: &mut impl FnMut(R, Key16, u64)) {
+         let (item, uid, h) = y;
+-        let person = self.lt.lookup(h, uid).unwrap_or(uid);
+-        let phash = person.hash(SEED_A);
++        let (person, phash) = match self.lt.lookup(h, uid) {
++            Some(p) => (p, p.hash(SEED_A)),
++            None => (uid, h),
++        };
+         self.cache[(h as usize) & (CACHE - 1)] = CEnt { uid, person, phash };
+         emit(item, person, phash);
+     }
+@@ -382,10 +386,13 @@ pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
+             counts[r] += v.len();
+         }
+     }
++    let total_nr: usize = counts.iter().sum();
++    let bloom_words = ((total_nr * 12 / 64).next_power_of_two()).clamp(1 << 10, 1 << 18);
++    let bloom_mask = bloom_words - 1;
+     let maxc = counts.iter().copied().max().unwrap_or(0);
+     let rbits = ((maxc + maxc / 2 + 1).next_power_of_two().max(4)).trailing_zeros();
+     let mut tab = vec![LEMPTY; REGIONS << rbits];
+-    let bloom: Vec<AtomicU64> = (0..BLOOM_WORDS).map(|_| AtomicU64::new(0)).collect();
++    let bloom: Vec<AtomicU64> = (0..bloom_words).map(|_| AtomicU64::new(0)).collect();
+     {
+         let tp = SyncPtr(tab.as_mut_ptr() as *mut u64);
+         let tp = &tp;
+@@ -404,7 +411,7 @@ pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
+                     let (root, x) = ((v >> 32) as usize, v as u32 as usize);
+                     let key = keys[x];
+                     let h = key.hash(SEED_L);
+-                    bloom[bloom_word(h)].fetch_or(bloom_bits(h), Ordering::Relaxed);
++                    bloom[bloom_word(h, bloom_mask)].fetch_or(bloom_bits(h), Ordering::Relaxed);
+                     let mut i = h as usize & rmask;
+                     unsafe {
+                         while (*tab.add((r << rbits) + i)).key.lo != 0 {
+@@ -416,7 +423,7 @@ pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
+             }
+         });
+     }
+-    LinkTable { tab, rbits, bloom: bloom.into_iter().map(|a| a.into_inner()).collect() }
++    LinkTable { tab, rbits, bloom: bloom.into_iter().map(|a| a.into_inner()).collect(), bloom_mask }
+ }
+ 
+ #[cfg(test)]
+diff --git a/src/main.rs b/src/main.rs
+index 86c1a96..5b26bb3 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -26,7 +26,7 @@ use std::time::Instant;
+ use arena::{ShardSet, Scatter, Segs};
+ use hash::hash;
+ use key::Key16;
+-use links::{LinkTable, Resolver, SEED_A};
++use links::{LinkTable, Resolver};
+ use parquet::{Column, Kind};
+ use ts::{parse_f1_fast, parse_price, parse_ts, DAY_MS};
+ 
+@@ -39,7 +39,7 @@ const SEED_MAP: u64 = 0x8bb8_4b93_962e_acc9;
+ 
+ const ID_BITS: u32 = 8;
+ const ID_SHARDS: usize = 1 << ID_BITS;
+-const P_BITS: u32 = 8;
++const P_BITS: u32 = 7;
+ const P_SHARDS: usize = 1 << P_BITS;
+ 
+ pub(crate) struct SyncPtr(pub *mut u64);
+@@ -265,15 +265,16 @@ fn enc_ingest(ms: Option<i64>, cat: u32) -> u64 {
+     (v << 8) | (cat >> 8) as u64
+ }
+ 
+-/// A surviving event, sharded by person (24 bytes). `pc` is 0 for non-purchases;
+-/// otherwise price << 8 | category, or (with more than 256 categories) 1 + an
+-/// index into the dedup threads' side tables.
++/// A surviving event, sharded by person (32 bytes = 64 B NT-store pairs).
++/// `key` = person-hash low 32 bits << 32 | ts; `bkt` = precomputed solve bucket.
++/// `pc` is 0 for non-purchases; otherwise price << 8 | category (or wide side idx).
+ #[derive(Clone, Copy)]
+ #[repr(C)]
+ struct PEv {
++    key: u64,
+     person: Key16,
+-    ts: u32,
+     pc: u32,
++    bkt: u32,
+ }
+ 
+ /// A valid click, sharded by person (48 bytes).
+@@ -287,19 +288,8 @@ struct Click {
+     camp: u32,
+ }
+ 
+-/// A person-shard event inside solve (32 bytes): `key` = person-hash low 32 bits
+-/// << 32 | ts, so small buckets sort on one u64.
+-#[derive(Clone, Copy)]
+-#[repr(C)]
+-struct SEv {
+-    key: u64,
+-    person: Key16,
+-    pc: u32,
+-    _pad: u32,
+-}
+-
+ const _: () = assert!(std::mem::size_of::<RawEv>() == 48);
+-const _: () = assert!(std::mem::size_of::<PEv>() == 24);
++const _: () = assert!(std::mem::size_of::<PEv>() == 32);
+ const _: () = assert!(std::mem::size_of::<Click>() == 48);
+ 
+ struct Ctx {
+@@ -366,40 +356,77 @@ impl Slot for u64 {
+ 
+ /// Exact event_id dedup of one shard: marks in `loser` (bit per record index
+ /// `seg << 9 | rec`) every copy that is not the one with the smallest ingest_ts
+-/// (the first one read on a tie). Tag matches are confirmed on the full Key16.
++/// (the first one read on a tie). Uses a 16-entry prefetch ring to hide L2/L3 latency.
+ fn mark_losers<S: Slot + Default + Clone>(segs: &Segs<RawEv>, table: &mut Vec<S>, cap: usize, loser: &mut [u64]) {
+     let mask = cap - 1;
+     table.clear();
+     table.resize(cap, S::default());
+     let rec = |idx: u32| -> &RawEv { unsafe { segs.seg((idx >> 9) as usize).get_unchecked((idx & 511) as usize) } };
+-    for si in 0..segs.segs.len() {
+-        for (ri, r) in segs.seg(si).iter().enumerate() {
+-            let h = r.eid.hash(SEED_ID);
+-            let me = ((si << 9) | ri) as u32;
+-            let mut i = h as usize & mask;
+-            loop {
+-                let slot = unsafe { *table.get_unchecked(i) };
+-                if slot.is_empty() {
+-                    table[i] = S::make(h, me);
+-                    break;
+-                }
+-                if slot.tag_eq(h) {
+-                    let oi = slot.idx();
+-                    let o = rec(oi);
+-                    if o.eid == r.eid {
+-                        if (r.ingest >> 8) < (o.ingest >> 8) {
+-                            loser[(oi >> 6) as usize] |= 1 << (oi & 63);
+-                            table[i] = S::make(h, me);
+-                        } else {
+-                            loser[(me >> 6) as usize] |= 1 << (me & 63);
+-                        }
+-                        break;
++    let tptr = table.as_ptr();
++
++    #[inline(always)]
++    fn probe<S: Slot>(
++        r: &RawEv,
++        h: u64,
++        me: u32,
++        mask: usize,
++        table: &mut [S],
++        loser: &mut [u64],
++        rec: impl Fn(u32) -> &'static RawEv,
++    ) {
++        let mut i = h as usize & mask;
++        loop {
++            let slot = unsafe { *table.get_unchecked(i) };
++            if slot.is_empty() {
++                unsafe { *table.get_unchecked_mut(i) = S::make(h, me) };
++                return;
++            }
++            if slot.tag_eq(h) {
++                let oi = slot.idx();
++                let o = rec(oi);
++                if o.eid == r.eid {
++                    if (r.ingest >> 8) < (o.ingest >> 8) {
++                        unsafe { *loser.get_unchecked_mut((oi >> 6) as usize) |= 1 << (oi & 63) };
++                        unsafe { *table.get_unchecked_mut(i) = S::make(h, me) };
++                    } else {
++                        unsafe { *loser.get_unchecked_mut((me >> 6) as usize) |= 1 << (me & 63) };
+                     }
++                    return;
+                 }
+-                i = (i + 1) & mask;
+             }
++            i = (i + 1) & mask;
+         }
+     }
++
++    const PF: usize = 16;
++    let mut ring: [(u64, u32, *const RawEv); PF] = [(0, 0, std::ptr::null()); PF];
++    let mut rn = 0usize;
++    let segs_ptr = segs as *const Segs<RawEv>;
++    let rec_static = |idx: u32| -> &'static RawEv {
++        unsafe { (*segs_ptr).seg((idx >> 9) as usize).get_unchecked((idx & 511) as usize) }
++    };
++
++    for si in 0..segs.segs.len() {
++        let seg = segs.seg(si);
++        let base_me = (si << 9) as u32;
++        for (ri, r) in seg.iter().enumerate() {
++            let h = r.eid.hash(SEED_ID);
++            let me = base_me | ri as u32;
++            links::prefetch(unsafe { tptr.add(h as usize & mask) } as *const u8);
++            if rn >= PF {
++                let (oh, ome, orp) = ring[rn & (PF - 1)];
++                probe(unsafe { &*orp }, oh, ome, mask, table, loser, rec_static);
++            }
++            ring[rn & (PF - 1)] = (h, me, r as *const RawEv);
++            rn += 1;
++        }
++    }
++    let rem = rn.min(PF);
++    for k in rn - rem..rn {
++        let (oh, ome, orp) = ring[k & (PF - 1)];
++        probe(unsafe { &*orp }, oh, ome, mask, table, loser, rec_static);
++    }
++    let _ = rec;
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -516,7 +543,7 @@ impl<'a> Worker<'a> {
+     }
+ 
+     /// One person: events sorted by ts, clicks sorted by (ts, click_id).
+-    fn person(&mut self, person: Key16, evs: &[SEv], clicks: &[Click]) {
++    fn person(&mut self, person: Key16, evs: &[PEv], clicks: &[Click]) {
+         self.sess.clear();
+         let day0ms = self.ctx.day0 * DAY_MS - self.ctx.base;
+         let mut cur_day = u32::MAX;
+@@ -622,14 +649,14 @@ impl<'a> Worker<'a> {
+ 
+     /// One person shard, bucketed by person hash; within a bucket events are sorted
+     /// by (pkey, ts) and clicks by (pkey, ts, click_id). Persons group exactly.
+-    fn shard(&mut self, evs: &[SEv], ec: &[u32], cls: &[Click], cc: &[u32]) {
++    fn shard(&mut self, evs: &[PEv], ec: &[u32], cls: &[Click], cc: &[u32]) {
+         for b in 0..NB {
+             let ev = &evs[ec[b] as usize..ec[b + 1] as usize];
+             let cl = &cls[cc[b] as usize..cc[b + 1] as usize];
+             let (mut i, mut ci) = (0usize, 0usize);
+             while i < ev.len() {
+                 let p = ev[i].person;
+-                let pk = sev_pk(&ev[i]);
++                let pk = pev_pk(&ev[i]);
+                 let mut j = i + 1;
+                 while j < ev.len() && ev[j].person == p {
+                     j += 1;
+@@ -652,7 +679,7 @@ impl<'a> Worker<'a> {
+ // ---------------------------------------------------------------------------
+ // bucket scatter (counting sort on the person-hash bits just below the shard bits)
+ 
+-const NB_BITS: u32 = 14;
++const NB_BITS: u32 = 11;
+ const NB: usize = 1 << NB_BITS;
+ 
+ #[inline(always)]
+@@ -660,25 +687,19 @@ fn bucket_of(phash: u64) -> usize {
+     ((phash >> (64 - P_BITS - NB_BITS)) as usize) & (NB - 1)
+ }
+ 
+-/// Copies all records of `segs` into `out` (transformed by `make`, which also gets
+-/// the record's person hash) grouped by bucket; afterwards bucket b is
+-/// `out[counts[b]..counts[b + 1]]`. `hs` caches each record's person hash.
+-fn bucket_scatter<T: Copy, U: Copy>(
++/// Copies all records of `segs` into `out` grouped by bucket (using `bkt(x)` directly,
++/// zero hash recomputation and zero temporary hash vector).
++fn bucket_scatter_direct<T: Copy>(
+     segs: &Segs<T>,
+-    phash: impl Fn(&T) -> u64,
+-    make: impl Fn(&T, u64) -> U,
++    bkt: impl Fn(&T) -> usize,
+     counts: &mut Vec<u32>,
+-    hs: &mut Vec<u64>,
+-    out: &mut Vec<U>,
++    out: &mut Vec<T>,
+ ) {
+     counts.clear();
+     counts.resize(NB + 1, 0);
+-    hs.clear();
+     for v in segs.iter() {
+         for x in v {
+-            let h = phash(x);
+-            hs.push(h);
+-            counts[bucket_of(h)] += 1;
++            unsafe { *counts.get_unchecked_mut(bkt(x)) += 1 };
+         }
+     }
+     let mut sum = 0u32;
+@@ -692,20 +713,16 @@ fn bucket_scatter<T: Copy, U: Copy>(
+     out.clear();
+     out.reserve(n);
+     let o = out.as_mut_ptr();
+-    let mut k = 0usize;
+     for v in segs.iter() {
+         for x in v {
+             unsafe {
+-                let h = *hs.get_unchecked(k);
+-                let c = counts.get_unchecked_mut(bucket_of(h));
+-                o.add(*c as usize).write(make(x, h));
++                let c = counts.get_unchecked_mut(bkt(x));
++                o.add(*c as usize).write(*x);
+                 *c += 1;
+             }
+-            k += 1;
+         }
+     }
+     unsafe { out.set_len(n) };
+-    // Cursors now hold bucket ends; shift to starts.
+     for i in (1..=NB).rev() {
+         counts[i] = counts[i - 1];
+     }
+@@ -812,19 +829,19 @@ fn sort_big<T: Copy>(
+ }
+ 
+ #[inline(always)]
+-fn sev_pk(e: &SEv) -> PKey {
++fn pev_pk(e: &PEv) -> PKey {
+     ((e.key >> 32) as u32, e.person)
+ }
+ 
+ /// Sorts one event bucket by (pkey, ts). Small buckets sort on the single u64 key
+ /// (ph32, ts); two persons sharing ph32 in one bucket are detected exactly and the
+ /// bucket is re-sorted by the full (ph32, person, ts).
+-fn sort_events(sl: &mut [SEv], tmp: &mut Vec<SEv>) {
++fn sort_events(sl: &mut [PEv], tmp: &mut Vec<PEv>) {
+     if sl.len() < 2 {
+         return;
+     }
+     if sl.len() > 256 {
+-        sort_big(sl, tmp, sev_pk, |e| e.key as u32, None);
++        sort_big(sl, tmp, pev_pk, |e| e.key as u32, None);
+         return;
+     }
+     sl.sort_unstable_by_key(|e| e.key);
+@@ -1067,10 +1084,12 @@ fn main() {
+     let next = AtomicUsize::new(0);
+     let side: Vec<Side> = par(threads, |tid| {
+         let mut w = Scatter::new(&ev_set);
+-        let zero = PEv { person: Key16::EMPTY, ts: 0, pc: 0 };
++        let zero = PEv { key: 0, person: Key16::EMPTY, pc: 0, bkt: 0 };
+         let mut res = Resolver::new(&ctx.links, zero);
+         let mut emit = |mut e: PEv, person: Key16, phash: u64| {
+             e.person = person;
++            e.key |= phash << 32;
++            e.bkt = bucket_of(phash) as u32;
+             w.push((phash >> (64 - P_BITS)) as usize, e);
+         };
+         let mut side: Side = Vec::new();
+@@ -1110,7 +1129,7 @@ fn main() {
+                         side.push((price, cat as u16));
+                         (((tid as u32) << 24) | (side.len() as u32 - 1)) + 1
+                     };
+-                    res.push(PEv { person: Key16::EMPTY, ts: r.ts, pc }, r.uid, &mut emit);
++                    res.push(PEv { key: r.ts as u64, person: Key16::EMPTY, pc, bkt: 0 }, r.uid, &mut emit);
+                 }
+             }
+             segs.free();
+@@ -1129,10 +1148,10 @@ fn main() {
+     let next = AtomicUsize::new(0);
+     let results: Vec<(Vec<URow>, Vec<CampAcc>)> = par(threads, |_| {
+         let mut w = Worker::new(ctx, side);
+-        let mut evs: Vec<SEv> = Vec::new();
++        let mut evs: Vec<PEv> = Vec::new();
+         let mut cls: Vec<Click> = Vec::new();
+-        let (mut ec, mut cc, mut hs) = (Vec::new(), Vec::new(), Vec::new());
+-        let (mut etmp, mut ctmp): (Vec<SEv>, Vec<Click>) = (Vec::new(), Vec::new());
++        let (mut ec, mut cc) = (Vec::new(), Vec::new());
++        let (mut etmp, mut ctmp): (Vec<PEv>, Vec<Click>) = (Vec::new(), Vec::new());
+         loop {
+             let k = next.fetch_add(1, Ordering::Relaxed);
+             if k >= P_SHARDS {
+@@ -1140,20 +1159,13 @@ fn main() {
+             }
+             let p = order[k].0;
+             let es = ev_set.take(p);
+-            bucket_scatter(
+-                &es,
+-                |e: &PEv| e.person.hash(SEED_A),
+-                |e: &PEv, h: u64| SEv { key: (h << 32) | e.ts as u64, person: e.person, pc: e.pc, _pad: 0 },
+-                &mut ec,
+-                &mut hs,
+-                &mut evs,
+-            );
++            bucket_scatter_direct(&es, |e: &PEv| e.bkt as usize, &mut ec, &mut evs);
+             es.free();
+             for b in 0..NB {
+                 sort_events(&mut evs[ec[b] as usize..ec[b + 1] as usize], &mut etmp);
+             }
+             let cs = click_set.take(p);
+-            bucket_scatter(&cs, |c: &Click| c.phash, |c: &Click, _| *c, &mut cc, &mut hs, &mut cls);
++            bucket_scatter_direct(&cs, |c: &Click| bucket_of(c.phash), &mut cc, &mut cls);
+             cs.free();
+             for b in 0..NB {
+                 sort_clicks(&mut cls[cc[b] as usize..cc[b + 1] as usize], &mut ctmp);
+@@ -1272,4 +1284,5 @@ fn main() {
+     }
+     line.push_str(&format!(" threads={threads} simd={} peak_rss_mb={:.1}", csv::simd_backend(), peak_rss_mb()));
+     eprintln!("{line}");
++    std::process::exit(0);
+ }

@@ -1,0 +1,25 @@
+[package]
+name = "shopping-sessions"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "shopping-sessions"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+incremental = false
+
+[profile.prof]
+inherits = "release"
+debug = "line-tables-only"
+strip = false

@@ -1,0 +1,1035 @@
+diff --git a/src/csv.rs b/src/csv.rs
+index 24cf887..6527dd6 100644
+--- a/src/csv.rs
++++ b/src/csv.rs
+@@ -244,6 +244,42 @@ unsafe fn scan_avx2<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(data: &'a [u8]
+                     }
+                     sm &= sm - 1;
+                 }
++            } else if qcnt == 0 && sm != 0 && {
++                let lz = sm.leading_zeros();
++                let hi_mask = if lz == 0 { !0u64 } else { (1u64 << (64 - lz)) - 1 };
++                let valid_edge = (sm << 1) | ((fs == i) as u64) | (sm >> 1);
++                (qm & (!hi_mask | !valid_edge)) == 0
++            } {
++                // Fast edge-quoted path (>95% of quoted blocks): zero interior quotes,
++                // zero quotes carried in or out. Validate each field with 2 edge checks.
++                while sm != 0 {
++                    let b = sm.trailing_zeros();
++                    let pos = i + b as usize;
++                    let (f0, f1) = if pos == fs {
++                        (fs, pos)
++                    } else {
++                        let q0 = *p.add(fs) == b'"';
++                        let q1 = *p.add(pos - 1) == b'"';
++                        let quoted = q0 && q1 && pos > fs + 1;
++                        bad |= !((!q0 && !q1) || quoted);
++                        let qu = quoted as usize;
++                        (fs + qu, pos - qu)
++                    };
++                    *fields.get_unchecked_mut(nf.min(N)) = (f0, f1);
++                    nf += 1;
++                    fs = pos + 1;
++                    if (nlm >> b) & 1 != 0 {
++                        if !bad && nf == N {
++                            let arr: [&'a [u8]; N] = std::array::from_fn(|k| {
++                                data.get_unchecked(fields[k].0..fields[k].1)
++                            });
++                            f(&arr);
++                        }
++                        nf = 0;
++                        bad = false;
++                    }
++                    sm &= sm - 1;
++                }
+             } else {
+                 while sm != 0 {
+                     let b = sm.trailing_zeros();
+diff --git a/src/links.rs b/src/links.rs
+index c2c029d..025c29c 100644
+--- a/src/links.rs
++++ b/src/links.rs
+@@ -14,14 +14,13 @@ use crate::key::Key16;
+ use crate::{csv, make_chunks, chunk_target, par, populate, release_chunk, SyncPtr};
+ 
+ pub const SEED_L: u64 = 0x9e37_79b9_7f4a_7c15;
+-pub const SEED_A: u64 = 0x2d35_8dcc_aa6c_78a5;
++pub const SEED_A: u64 = SEED_L;
+ 
+ const REGION_BITS: u32 = 8;
+ const REGIONS: usize = 1 << REGION_BITS;
+ /// Link-side shards for interning (each holds at least one 2 MB block).
+ const SIDE_BITS: u32 = 6;
+ const SIDE_SHARDS: usize = 1 << SIDE_BITS;
+-const BLOOM_WORDS: usize = 1 << 18; // 1 << 24 bits = 2 MB
+ 
+ #[derive(Clone, Copy)]
+ #[repr(C, align(32))]
+@@ -36,11 +35,12 @@ pub struct LinkTable {
+     tab: Vec<LEnt>,
+     rbits: u32, // log2 slots per region
+     bloom: Vec<u64>,
++    bloom_mask: usize,
+ }
+ 
+ #[inline(always)]
+-fn bloom_word(h: u64) -> usize {
+-    ((h >> 38) as usize) & (BLOOM_WORDS - 1)
++fn bloom_word(h: u64, mask: usize) -> usize {
++    ((h >> 32) as usize) & mask
+ }
+ #[inline(always)]
+ fn bloom_bits(h: u64) -> u64 {
+@@ -68,7 +68,7 @@ impl LinkTable {
+     #[inline(always)]
+     pub fn maybe(&self, h: u64) -> bool {
+         let b = bloom_bits(h);
+-        unsafe { *self.bloom.get_unchecked(bloom_word(h)) & b == b }
++        unsafe { *self.bloom.get_unchecked(bloom_word(h, self.bloom_mask)) & b == b }
+     }
+ 
+     #[inline(always)]
+@@ -114,7 +114,7 @@ struct CEnt {
+     phash: u64,
+ }
+ 
+-const CACHE: usize = 64;
++const CACHE: usize = 128;
+ /// Items between the Bloom-word prefetch and the Bloom test.
+ const RA: usize = 8;
+ /// Items between the table-slot prefetch and the table probe.
+@@ -159,7 +159,7 @@ impl<'a, R: Copy> Resolver<'a, R> {
+             emit(item, c.person, c.phash);
+             return;
+         }
+-        prefetch(unsafe { self.lt.bloom.as_ptr().add(bloom_word(h)) } as *const u8);
++        prefetch(unsafe { self.lt.bloom.as_ptr().add(bloom_word(h, self.lt.bloom_mask)) } as *const u8);
+         if self.at - self.ah == RA {
+             let x = self.a[self.ah % RA];
+             self.ah += 1;
+@@ -173,7 +173,8 @@ impl<'a, R: Copy> Resolver<'a, R> {
+     fn stage_b(&mut self, x: Item<R>, emit: &mut impl FnMut(R, Key16, u64)) {
+         let (item, uid, h) = x;
+         if !self.lt.maybe(h) {
+-            emit(item, uid, uid.hash(SEED_A));
++            self.cache[(h as usize) & (CACHE - 1)] = CEnt { uid, person: uid, phash: h };
++            emit(item, uid, h);
+             return;
+         }
+         self.lt.prefetch(h);
+@@ -189,8 +190,10 @@ impl<'a, R: Copy> Resolver<'a, R> {
+     #[inline(always)]
+     fn finish_one(&mut self, y: Item<R>, emit: &mut impl FnMut(R, Key16, u64)) {
+         let (item, uid, h) = y;
+-        let person = self.lt.lookup(h, uid).unwrap_or(uid);
+-        let phash = person.hash(SEED_A);
++        let (person, phash) = match self.lt.lookup(h, uid) {
++            Some(p) => (p, p.hash(SEED_A)),
++            None => (uid, h),
++        };
+         self.cache[(h as usize) & (CACHE - 1)] = CEnt { uid, person, phash };
+         emit(item, person, phash);
+     }
+@@ -382,10 +385,13 @@ pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
+             counts[r] += v.len();
+         }
+     }
++    let total_nr: usize = counts.iter().sum();
++    let bloom_words = ((total_nr * 12 / 64).next_power_of_two()).clamp(1 << 10, 1 << 18);
++    let bloom_mask = bloom_words - 1;
+     let maxc = counts.iter().copied().max().unwrap_or(0);
+     let rbits = ((maxc + maxc / 2 + 1).next_power_of_two().max(4)).trailing_zeros();
+     let mut tab = vec![LEMPTY; REGIONS << rbits];
+-    let bloom: Vec<AtomicU64> = (0..BLOOM_WORDS).map(|_| AtomicU64::new(0)).collect();
++    let bloom: Vec<AtomicU64> = (0..bloom_words).map(|_| AtomicU64::new(0)).collect();
+     {
+         let tp = SyncPtr(tab.as_mut_ptr() as *mut u64);
+         let tp = &tp;
+@@ -404,7 +410,7 @@ pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
+                     let (root, x) = ((v >> 32) as usize, v as u32 as usize);
+                     let key = keys[x];
+                     let h = key.hash(SEED_L);
+-                    bloom[bloom_word(h)].fetch_or(bloom_bits(h), Ordering::Relaxed);
++                    bloom[bloom_word(h, bloom_mask)].fetch_or(bloom_bits(h), Ordering::Relaxed);
+                     let mut i = h as usize & rmask;
+                     unsafe {
+                         while (*tab.add((r << rbits) + i)).key.lo != 0 {
+@@ -416,7 +422,7 @@ pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
+             }
+         });
+     }
+-    LinkTable { tab, rbits, bloom: bloom.into_iter().map(|a| a.into_inner()).collect() }
++    LinkTable { tab, rbits, bloom: bloom.into_iter().map(|a| a.into_inner()).collect(), bloom_mask }
+ }
+ 
+ #[cfg(test)]
+diff --git a/src/main.rs b/src/main.rs
+index 86c1a96..e8c3c0c 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -28,7 +28,7 @@ use hash::hash;
+ use key::Key16;
+ use links::{LinkTable, Resolver, SEED_A};
+ use parquet::{Column, Kind};
+-use ts::{parse_f1_fast, parse_price, parse_ts, DAY_MS};
++use ts::{parse_price, parse_ts, DateCache, DAY_MS};
+ 
+ const GAP_MS: i64 = 1_800_000;
+ const SEVEN_DAYS_MS: i64 = 7 * DAY_MS;
+@@ -287,20 +287,28 @@ struct Click {
+     camp: u32,
+ }
+ 
+-/// A person-shard event inside solve (32 bytes): `key` = person-hash low 32 bits
+-/// << 32 | ts, so small buckets sort on one u64.
++/// Compact 8-byte event inside solve (4x smaller than SEv -> fits in L2!).
+ #[derive(Clone, Copy)]
+ #[repr(C)]
+-struct SEv {
+-    key: u64,
+-    person: Key16,
++struct Ev8 {
++    ts: u32,
+     pc: u32,
+-    _pad: u32,
++}
++
++/// Compact 24-byte click inside solve (2x smaller than Click).
++#[derive(Clone, Copy)]
++#[repr(C)]
++struct Cl24 {
++    cid: Key16,
++    ts: u32,
++    camp: u32,
+ }
+ 
+ const _: () = assert!(std::mem::size_of::<RawEv>() == 48);
+ const _: () = assert!(std::mem::size_of::<PEv>() == 24);
+ const _: () = assert!(std::mem::size_of::<Click>() == 48);
++const _: () = assert!(std::mem::size_of::<Ev8>() == 8);
++const _: () = assert!(std::mem::size_of::<Cl24>() == 24);
+ 
+ struct Ctx {
+     ws: i64,
+@@ -308,6 +316,7 @@ struct Ctx {
+     we: i64,
+     day0: i64,
+     ndays: usize,
++    dates: DateCache,
+     products: StrMap,
+     unknown_cat: u32,
+     cat_names: Vec<&'static [u8]>,
+@@ -516,14 +525,14 @@ impl<'a> Worker<'a> {
+     }
+ 
+     /// One person: events sorted by ts, clicks sorted by (ts, click_id).
+-    fn person(&mut self, person: Key16, evs: &[SEv], clicks: &[Click]) {
++    fn person(&mut self, person: Key16, evs: &[Ev8], clicks: &[Cl24]) {
+         self.sess.clear();
+         let day0ms = self.ctx.day0 * DAY_MS - self.ctx.base;
+         let mut cur_day = u32::MAX;
+         let (mut ns, mut ne, mut rev) = (0u32, 0u32, 0u64);
+         let mut prev = i64::MIN;
+         for e in evs {
+-            let ts = e.key as u32 as i64;
++            let ts = e.ts as i64;
+             if self.sess.is_empty() || ts - prev > GAP_MS {
+                 let day = ((ts - day0ms) / DAY_MS) as u32;
+                 if day != cur_day {
+@@ -620,97 +629,10 @@ impl<'a> Worker<'a> {
+         }
+     }
+ 
+-    /// One person shard, bucketed by person hash; within a bucket events are sorted
+-    /// by (pkey, ts) and clicks by (pkey, ts, click_id). Persons group exactly.
+-    fn shard(&mut self, evs: &[SEv], ec: &[u32], cls: &[Click], cc: &[u32]) {
+-        for b in 0..NB {
+-            let ev = &evs[ec[b] as usize..ec[b + 1] as usize];
+-            let cl = &cls[cc[b] as usize..cc[b + 1] as usize];
+-            let (mut i, mut ci) = (0usize, 0usize);
+-            while i < ev.len() {
+-                let p = ev[i].person;
+-                let pk = sev_pk(&ev[i]);
+-                let mut j = i + 1;
+-                while j < ev.len() && ev[j].person == p {
+-                    j += 1;
+-                }
+-                while ci < cl.len() && click_pk(&cl[ci]) < pk {
+-                    ci += 1;
+-                }
+-                let mut cj = ci;
+-                while cj < cl.len() && cl[cj].person == p {
+-                    cj += 1;
+-                }
+-                self.person(p, &ev[i..j], &cl[ci..cj]);
+-                i = j;
+-                ci = cj;
+-            }
+-        }
+-    }
+ }
+ 
+ // ---------------------------------------------------------------------------
+-// bucket scatter (counting sort on the person-hash bits just below the shard bits)
+-
+-const NB_BITS: u32 = 14;
+-const NB: usize = 1 << NB_BITS;
+-
+-#[inline(always)]
+-fn bucket_of(phash: u64) -> usize {
+-    ((phash >> (64 - P_BITS - NB_BITS)) as usize) & (NB - 1)
+-}
+-
+-/// Copies all records of `segs` into `out` (transformed by `make`, which also gets
+-/// the record's person hash) grouped by bucket; afterwards bucket b is
+-/// `out[counts[b]..counts[b + 1]]`. `hs` caches each record's person hash.
+-fn bucket_scatter<T: Copy, U: Copy>(
+-    segs: &Segs<T>,
+-    phash: impl Fn(&T) -> u64,
+-    make: impl Fn(&T, u64) -> U,
+-    counts: &mut Vec<u32>,
+-    hs: &mut Vec<u64>,
+-    out: &mut Vec<U>,
+-) {
+-    counts.clear();
+-    counts.resize(NB + 1, 0);
+-    hs.clear();
+-    for v in segs.iter() {
+-        for x in v {
+-            let h = phash(x);
+-            hs.push(h);
+-            counts[bucket_of(h)] += 1;
+-        }
+-    }
+-    let mut sum = 0u32;
+-    for i in 0..NB {
+-        let c = counts[i];
+-        counts[i] = sum;
+-        sum += c;
+-    }
+-    counts[NB] = sum;
+-    let n = sum as usize;
+-    out.clear();
+-    out.reserve(n);
+-    let o = out.as_mut_ptr();
+-    let mut k = 0usize;
+-    for v in segs.iter() {
+-        for x in v {
+-            unsafe {
+-                let h = *hs.get_unchecked(k);
+-                let c = counts.get_unchecked_mut(bucket_of(h));
+-                o.add(*c as usize).write(make(x, h));
+-                *c += 1;
+-            }
+-            k += 1;
+-        }
+-    }
+-    unsafe { out.set_len(n) };
+-    // Cursors now hold bucket ends; shift to starts.
+-    for i in (1..=NB).rev() {
+-        counts[i] = counts[i - 1];
+-    }
+-    counts[0] = 0;
+-}
++// per-shard direct person interning + compact L2 solve (8B Ev8 + 24B Cl24)
+ 
+ /// Stable LSD radix sort of `v` by a 32-bit key (3 passes of 11 bits; passes in
+ /// which every key has the same digit are skipped).
+@@ -739,7 +661,6 @@ fn radix_by_u32<T: Copy>(v: &mut [T], tmp: &mut Vec<T>, key: impl Fn(&T) -> u32)
+         }
+         let sh = pass as u32 * 11;
+         let (src, dst): (&[T], &mut [T]) = if in_v { (&*v, &mut tmp[..]) } else { (&tmp[..], &mut *v) };
+-        // SAFETY of the split borrow above: `v` and `tmp` are distinct buffers.
+         let dst = dst.as_mut_ptr();
+         for x in src {
+             let d = ((key(x) >> sh) & 2047) as usize;
+@@ -753,102 +674,268 @@ fn radix_by_u32<T: Copy>(v: &mut [T], tmp: &mut Vec<T>, key: impl Fn(&T) -> u32)
+     }
+ }
+ 
+-/// Person order used throughout solve: (low 32 bits of the person hash, exact key).
+-type PKey = (u32, Key16);
+-
+-/// Sorts a big bucket (whale / shared-device persons) by (pkey, ts, tie): radix sort
+-/// on ts, a stable split by person, then a tie sort of equal-(person, ts) runs.
+-fn sort_big<T: Copy>(
+-    sl: &mut [T],
+-    tmp: &mut Vec<T>,
+-    pk: impl Fn(&T) -> PKey,
+-    ts: impl Fn(&T) -> u32,
+-    tie: Option<fn(&T, &T) -> std::cmp::Ordering>,
+-) {
+-    radix_by_u32(sl, tmp, &ts);
+-    let mut ps: Vec<PKey> = Vec::new();
+-    for x in sl.iter() {
+-        let p = pk(x);
+-        if !ps.contains(&p) {
+-            ps.push(p);
+-            if ps.len() > 64 {
+-                break;
+-            }
+-        }
++#[inline(always)]
++fn sort_person_events(sl: &mut [Ev8], tmp: &mut Vec<Ev8>) {
++    let n = sl.len();
++    if n < 2 {
++        return;
+     }
+-    if ps.len() > 64 {
+-        // Many persons share this bucket: a stable sort by person keeps ts order.
+-        sl.sort_by_key(|x| pk(x));
+-    } else if ps.len() > 1 {
+-        ps.sort_unstable();
+-        let mut cnt = vec![0usize; ps.len() + 1];
+-        for x in sl.iter() {
+-            cnt[ps.binary_search(&pk(x)).unwrap() + 1] += 1;
+-        }
+-        for i in 1..=ps.len() {
+-            cnt[i] += cnt[i - 1];
+-        }
+-        tmp.clear();
+-        tmp.extend_from_slice(sl);
+-        for x in tmp.iter() {
+-            let r = ps.binary_search(&pk(x)).unwrap();
+-            sl[cnt[r]] = *x;
+-            cnt[r] += 1;
+-        }
++    if n > 256 {
++        radix_by_u32(sl, tmp, |e| e.ts);
++    } else {
++        sl.sort_unstable_by_key(|e| e.ts);
++    }
++}
++
++#[inline(always)]
++fn sort_person_clicks(sl: &mut [Cl24], tmp: &mut Vec<Cl24>) {
++    let n = sl.len();
++    if n < 2 {
++        return;
+     }
+-    if let Some(t) = tie {
++    if n > 256 {
++        radix_by_u32(sl, tmp, |c| c.ts);
+         let mut i = 0;
+-        while i < sl.len() {
++        while i < n {
+             let mut j = i + 1;
+-            while j < sl.len() && ts(&sl[j]) == ts(&sl[i]) && pk(&sl[j]) == pk(&sl[i]) {
++            while j < n && sl[j].ts == sl[i].ts {
+                 j += 1;
+             }
+             if j - i > 1 {
+-                sl[i..j].sort_unstable_by(t);
++                sl[i..j].sort_unstable_by(|a, b| a.cid.cmp_bytes(&b.cid));
+             }
+             i = j;
+         }
++    } else {
++        sl.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.cid.cmp_bytes(&b.cid)));
+     }
+ }
+ 
+-#[inline(always)]
+-fn sev_pk(e: &SEv) -> PKey {
+-    ((e.key >> 32) as u32, e.person)
++/// Scratch buffers reused across all shards handled by one solve worker.
++struct SolveScratch {
++    ht: Vec<u32>,
++    ht_mask: usize,
++    pkeys: Vec<Key16>,
++    ev_off: Vec<u32>,
++    ev_cur: Vec<u32>,
++    ev_pids: Vec<u32>,
++    evs: Vec<Ev8>,
++    etmp: Vec<Ev8>,
++    cl_off: Vec<u32>,
++    cl_cur: Vec<u32>,
++    cl_pids: Vec<u32>,
++    cls: Vec<Cl24>,
++    ctmp: Vec<Cl24>,
+ }
+ 
+-/// Sorts one event bucket by (pkey, ts). Small buckets sort on the single u64 key
+-/// (ph32, ts); two persons sharing ph32 in one bucket are detected exactly and the
+-/// bucket is re-sorted by the full (ph32, person, ts).
+-fn sort_events(sl: &mut [SEv], tmp: &mut Vec<SEv>) {
+-    if sl.len() < 2 {
+-        return;
++impl SolveScratch {
++    fn new() -> Self {
++        SolveScratch {
++            ht: Vec::new(),
++            ht_mask: 0,
++            pkeys: Vec::new(),
++            ev_off: Vec::new(),
++            ev_cur: Vec::new(),
++            ev_pids: Vec::new(),
++            evs: Vec::new(),
++            etmp: Vec::new(),
++            cl_off: Vec::new(),
++            cl_cur: Vec::new(),
++            cl_pids: Vec::new(),
++            cls: Vec::new(),
++            ctmp: Vec::new(),
++        }
+     }
+-    if sl.len() > 256 {
+-        sort_big(sl, tmp, sev_pk, |e| e.key as u32, None);
+-        return;
++
++    fn reset_ht(&mut self, cap: usize) {
++        self.ht.clear();
++        self.ht.resize(cap, 0);
++        self.ht_mask = cap - 1;
+     }
+-    sl.sort_unstable_by_key(|e| e.key);
+-    let collide = sl.windows(2).any(|w| (w[0].key >> 32) == (w[1].key >> 32) && w[0].person != w[1].person);
+-    if collide {
+-        sl.sort_unstable_by_key(|e| (e.key >> 32, e.person, e.key as u32));
++
++    #[inline(always)]
++    fn intern(&mut self, person: Key16) -> u32 {
++        // Grow if load > 50%
++        if self.pkeys.len() * 2 >= self.ht.len() {
++            self.grow_ht();
++        }
++        let mask = self.ht_mask;
++        let mut i = person.hash(SEED_A) as usize & mask;
++        loop {
++            let slot = unsafe { *self.ht.get_unchecked(i) };
++            if slot == 0 {
++                let pid = self.pkeys.len() as u32;
++                self.pkeys.push(person);
++                self.ev_off.push(1);
++                unsafe { *self.ht.get_unchecked_mut(i) = pid + 1 };
++                return pid;
++            }
++            let pid = slot - 1;
++            if unsafe { *self.pkeys.get_unchecked(pid as usize) } == person {
++                unsafe { *self.ev_off.get_unchecked_mut(pid as usize) += 1 };
++                return pid;
++            }
++            i = (i + 1) & mask;
++        }
+     }
+-}
+ 
+-#[inline(always)]
+-fn click_pk(c: &Click) -> PKey {
+-    (c.phash as u32, c.person)
+-}
++    #[cold]
++    fn grow_ht(&mut self) {
++        let new_cap = (self.ht.len() * 2).max(256);
++        self.reset_ht(new_cap);
++        let mask = self.ht_mask;
++        for (pid, &pk) in self.pkeys.iter().enumerate() {
++            let mut i = pk.hash(SEED_A) as usize & mask;
++            while self.ht[i] != 0 {
++                i = (i + 1) & mask;
++            }
++            self.ht[i] = pid as u32 + 1;
++        }
++    }
+ 
+-/// Sorts one click bucket by (pkey, ts, click_id).
+-fn sort_clicks(sl: &mut [Click], tmp: &mut Vec<Click>) {
+-    if sl.len() < 2 {
+-        return;
++    #[inline(always)]
++    fn lookup(&self, person: Key16, phash: u64) -> Option<u32> {
++        let mask = self.ht_mask;
++        let mut i = phash as usize & mask;
++        loop {
++            let slot = unsafe { *self.ht.get_unchecked(i) };
++            if slot == 0 {
++                return None;
++            }
++            let pid = slot - 1;
++            if unsafe { *self.pkeys.get_unchecked(pid as usize) } == person {
++                return Some(pid);
++            }
++            i = (i + 1) & mask;
++        }
+     }
+-    if sl.len() > 256 {
+-        sort_big(sl, tmp, click_pk, |c| c.ts, Some(|a: &Click, b: &Click| a.cid.cmp_bytes(&b.cid)));
+-        return;
++
++    fn run_shard(&mut self, es: Segs<PEv>, cs: Segs<Click>, w: &mut Worker<'_>) {
++        let nev = es.len();
++        if nev == 0 {
++            es.free();
++            cs.free();
++            return;
++        }
++        // Estimate ~1 person per 12 events (safe initial load, grows automatically if needed)
++        let init_cap = ((nev / 6).next_power_of_two()).max(256);
++        self.reset_ht(init_cap);
++        self.pkeys.clear();
++        self.ev_off.clear();
++        self.ev_pids.clear();
++        self.ev_pids.reserve(nev);
++
++        // Pass 1 over events: intern exact Key16 persons in L1/L2 hash table
++        for seg in es.iter() {
++            for e in seg {
++                let pid = self.intern(e.person);
++                self.ev_pids.push(pid);
++            }
++        }
++        let np = self.pkeys.len();
++
++        // Prefix sums for events
++        let mut sum = 0u32;
++        self.ev_cur.clear();
++        self.ev_cur.reserve(np);
++        for c in &mut self.ev_off {
++            let cnt = *c;
++            *c = sum;
++            self.ev_cur.push(sum);
++            sum += cnt;
++        }
++        self.ev_off.push(sum);
++
++        // Pass 2 over events: scatter compact 8-byte Ev8 into L2-resident buffer
++        self.evs.clear();
++        self.evs.reserve(nev);
++        let eo = self.evs.as_mut_ptr();
++        let mut k = 0usize;
++        for seg in es.iter() {
++            for e in seg {
++                unsafe {
++                    let pid = *self.ev_pids.get_unchecked(k) as usize;
++                    let dst = self.ev_cur.get_unchecked_mut(pid);
++                    eo.add(*dst as usize).write(Ev8 { ts: e.ts, pc: e.pc });
++                    *dst += 1;
++                }
++                k += 1;
++            }
++        }
++        unsafe { self.evs.set_len(nev) };
++        es.free();
++
++        // Clicks: lookup in the same L1/L2 person table; drop clicks for persons with 0 events!
++        let ncl_raw = cs.len();
++        self.cl_off.clear();
++        self.cl_off.resize(np + 1, 0);
++        self.cl_pids.clear();
++        self.cl_pids.reserve(ncl_raw);
++        let mut ncl_kept = 0usize;
++        if ncl_raw > 0 {
++            for seg in cs.iter() {
++                for c in seg {
++                    if let Some(pid) = self.lookup(c.person, c.phash) {
++                        self.cl_pids.push(pid);
++                        unsafe { *self.cl_off.get_unchecked_mut(pid as usize) += 1 };
++                        ncl_kept += 1;
++                    } else {
++                        self.cl_pids.push(u32::MAX);
++                    }
++                }
++            }
++        }
++
++        self.cls.clear();
++        if ncl_kept > 0 {
++            let mut csum = 0u32;
++            self.cl_cur.clear();
++            self.cl_cur.reserve(np);
++            for i in 0..np {
++                let cnt = self.cl_off[i];
++                self.cl_off[i] = csum;
++                self.cl_cur.push(csum);
++                csum += cnt;
++            }
++            self.cl_off[np] = csum;
++            self.cls.reserve(ncl_kept);
++            let co = self.cls.as_mut_ptr();
++            let mut ck = 0usize;
++            for seg in cs.iter() {
++                for c in seg {
++                    let pid = unsafe { *self.cl_pids.get_unchecked(ck) };
++                    ck += 1;
++                    if pid != u32::MAX {
++                        unsafe {
++                            let dst = self.cl_cur.get_unchecked_mut(pid as usize);
++                            co.add(*dst as usize).write(Cl24 { cid: c.cid, ts: c.ts, camp: c.camp });
++                            *dst += 1;
++                        }
++                    }
++                }
++            }
++            unsafe { self.cls.set_len(ncl_kept) };
++        }
++        cs.free();
++
++        // Process each person cleanly in L1/L2 cache
++        for pid in 0..np {
++            let es0 = self.ev_off[pid] as usize;
++            let es1 = self.ev_off[pid + 1] as usize;
++            sort_person_events(&mut self.evs[es0..es1], &mut self.etmp);
++            let cls_slice: &[Cl24] = if ncl_kept > 0 {
++                let cs0 = self.cl_off[pid] as usize;
++                let cs1 = self.cl_off[pid + 1] as usize;
++                if cs1 > cs0 {
++                    sort_person_clicks(&mut self.cls[cs0..cs1], &mut self.ctmp);
++                }
++                &self.cls[cs0..cs1]
++            } else {
++                &[]
++            };
++            w.person(self.pkeys[pid], &self.evs[es0..es1], cls_slice);
++        }
+     }
+-    sl.sort_unstable_by(|a, b| (click_pk(a), a.ts).cmp(&(click_pk(b), b.ts)).then_with(|| a.cid.cmp_bytes(&b.cid)));
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -951,6 +1038,7 @@ fn main() {
+         we,
+         day0,
+         ndays,
++        dates: DateCache::new(ws, we),
+         products,
+         unknown_cat,
+         cat_names,
+@@ -989,7 +1077,7 @@ fn main() {
+                     return;
+                 }
+                 let Some(camp) = ctx.camps.get(f[2]) else { return };
+-                let ts = match parse_ts(f[3]) {
++                let ts = match ctx.dates.parse_ts(f[3]) {
+                     Some(t) if t >= cws && t < ctx.we => t,
+                     _ => return,
+                 };
+@@ -1021,7 +1109,7 @@ fn main() {
+                 if eid.is_empty() {
+                     return;
+                 }
+-                let ingest = parse_f1_fast(f[3]);
++                let ingest = ctx.dates.parse_f1_ingest(f[3]);
+                 let ek = Key16::new(eid);
+                 let mut r = RawEv { eid: ek, uid: Key16::EMPTY, ingest: enc_ingest(ingest, 0), ts: TS_INVALID, price: 0 };
+                 'v: {
+@@ -1030,7 +1118,7 @@ fn main() {
+                     if uid.is_empty() || f[5].is_empty() {
+                         break 'v;
+                     }
+-                    let ts = match parse_ts(f[2]) {
++                    let ts = match ctx.dates.parse_ts(f[2]) {
+                         Some(t) if t >= ctx.ws && t < ctx.we => t,
+                         _ => break 'v,
+                     };
+@@ -1129,10 +1217,7 @@ fn main() {
+     let next = AtomicUsize::new(0);
+     let results: Vec<(Vec<URow>, Vec<CampAcc>)> = par(threads, |_| {
+         let mut w = Worker::new(ctx, side);
+-        let mut evs: Vec<SEv> = Vec::new();
+-        let mut cls: Vec<Click> = Vec::new();
+-        let (mut ec, mut cc, mut hs) = (Vec::new(), Vec::new(), Vec::new());
+-        let (mut etmp, mut ctmp): (Vec<SEv>, Vec<Click>) = (Vec::new(), Vec::new());
++        let mut sc = SolveScratch::new();
+         loop {
+             let k = next.fetch_add(1, Ordering::Relaxed);
+             if k >= P_SHARDS {
+@@ -1140,25 +1225,8 @@ fn main() {
+             }
+             let p = order[k].0;
+             let es = ev_set.take(p);
+-            bucket_scatter(
+-                &es,
+-                |e: &PEv| e.person.hash(SEED_A),
+-                |e: &PEv, h: u64| SEv { key: (h << 32) | e.ts as u64, person: e.person, pc: e.pc, _pad: 0 },
+-                &mut ec,
+-                &mut hs,
+-                &mut evs,
+-            );
+-            es.free();
+-            for b in 0..NB {
+-                sort_events(&mut evs[ec[b] as usize..ec[b + 1] as usize], &mut etmp);
+-            }
+             let cs = click_set.take(p);
+-            bucket_scatter(&cs, |c: &Click| c.phash, |c: &Click, _| *c, &mut cc, &mut hs, &mut cls);
+-            cs.free();
+-            for b in 0..NB {
+-                sort_clicks(&mut cls[cc[b] as usize..cc[b + 1] as usize], &mut ctmp);
+-            }
+-            w.shard(&evs, &ec, &cls, &cc);
++            sc.run_shard(es, cs, &mut w);
+         }
+         (std::mem::take(&mut w.rows), std::mem::take(&mut w.acc))
+     });
+@@ -1272,4 +1340,5 @@ fn main() {
+     }
+     line.push_str(&format!(" threads={threads} simd={} peak_rss_mb={:.1}", csv::simd_backend(), peak_rss_mb()));
+     eprintln!("{line}");
++    std::process::exit(0);
+ }
+diff --git a/src/ts.rs b/src/ts.rs
+index 450d7d9..c058c9e 100644
+--- a/src/ts.rs
++++ b/src/ts.rs
+@@ -168,6 +168,206 @@ pub fn parse_f1_fast(b: &[u8]) -> Option<i64> {
+     parse_ts(b)
+ }
+ 
++/// Direct-mapped 32-slot L1 date-prefix cache indexed by day-of-month (`1..=31`).
++/// For any <=27-day window (14d window + 7d click lookback + 6d late ingest), every
++/// calendar day-of-month is unique, so 100% of in-window F1/F2 dates hit with a
++/// single u64 prefix compare (`"YYYY-MM-"`) and skip all calendar/leap math.
++#[derive(Clone, Copy)]
++#[repr(C)]
++struct DateSlot {
++    prefix: u64, // little-endian 8 bytes "YYYY-MM-"; 0 = empty
++    day_ms: i64,
++}
++
++pub struct DateCache {
++    slots: [DateSlot; 32],
++}
++
++fn civil_from_days(days: i64) -> (i64, u32, u32) {
++    let z = days + 719_468;
++    let era = z.div_euclid(146_097);
++    let doe = (z - era * 146_097) as u64;
++    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
++    let y = yoe as i64 + era * 400;
++    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
++    let mp = (5 * doy + 2) / 153;
++    let d = doy - (153 * mp + 2) / 5 + 1;
++    let m = if mp < 10 { mp + 3 } else { mp - 9 };
++    (y + i64::from(m <= 2), m as u32, d as u32)
++}
++
++impl DateCache {
++    pub fn new(ws: i64, we: i64) -> DateCache {
++        let mut slots = [DateSlot { prefix: 0, day_ms: 0 }; 32];
++        let d_start = (ws - 8 * DAY_MS).div_euclid(DAY_MS);
++        let d_end = (we + 6 * DAY_MS).div_euclid(DAY_MS);
++        let count = (d_end - d_start + 1).clamp(0, 28);
++        for off in 0..count {
++            let day = d_start + off;
++            let (y, m, d) = civil_from_days(day);
++            if y >= 1 && y <= 9999 && d >= 1 && d <= 31 {
++                let s = format!("{y:04}-{m:02}-");
++                let prefix = u64::from_le_bytes(s.as_bytes()[0..8].try_into().unwrap());
++                slots[d as usize] = DateSlot { prefix, day_ms: day * DAY_MS };
++            }
++        }
++        DateCache { slots }
++    }
++
++    #[inline(always)]
++    fn calendar_cached(&self, b: &[u8]) -> Option<i64> {
++        let p = b.as_ptr();
++        unsafe {
++            let d0 = (*p.add(8)).wrapping_sub(b'0');
++            let d1 = (*p.add(9)).wrapping_sub(b'0');
++            let d = (d0 as u32 * 10 + d1 as u32) as usize;
++            if ((non_digit_bits(d0) | non_digit_bits(d1)) & 0xF0) == 0 && d < 32 {
++                let slot = *self.slots.get_unchecked(d);
++                let pref = (p as *const u64).read_unaligned();
++                if pref == slot.prefix
++                    && ((*p.add(10) ^ b'T') | (*p.add(13) ^ b':') | (*p.add(16) ^ b':')) == 0
++                {
++                    let h0 = (*p.add(11)).wrapping_sub(b'0');
++                    let h1 = (*p.add(12)).wrapping_sub(b'0');
++                    let n0 = (*p.add(14)).wrapping_sub(b'0');
++                    let n1 = (*p.add(15)).wrapping_sub(b'0');
++                    let s0 = (*p.add(17)).wrapping_sub(b'0');
++                    let s1 = (*p.add(18)).wrapping_sub(b'0');
++                    let bad = non_digit_bits(h0)
++                        | non_digit_bits(h1)
++                        | non_digit_bits(n0)
++                        | non_digit_bits(n1)
++                        | non_digit_bits(s0)
++                        | non_digit_bits(s1);
++                    if (bad & 0xF0) == 0 {
++                        let h = h0 as u32 * 10 + h1 as u32;
++                        let mi = n0 as u32 * 10 + n1 as u32;
++                        let s = s0 as u32 * 10 + s1 as u32;
++                        if h <= 23 && mi <= 59 && s <= 59 {
++                            return Some(slot.day_ms + (h as i64 * 3600 + mi as i64 * 60 + s as i64) * 1000);
++                        }
++                    }
++                    return None;
++                }
++            }
++        }
++        calendar(b)
++    }
++
++    /// Ultra-fast path for `ingest_ts` (guaranteed valid F1 per rules.md).
++    #[inline(always)]
++    pub fn parse_f1_ingest(&self, b: &[u8]) -> Option<i64> {
++        if b.len() == 20 {
++            let p = b.as_ptr();
++            unsafe {
++                let d = ((*p.add(8)).wrapping_sub(b'0') as usize) * 10
++                    + (*p.add(9)).wrapping_sub(b'0') as usize;
++                if d < 32 {
++                    let slot = *self.slots.get_unchecked(d);
++                    if (p as *const u64).read_unaligned() == slot.prefix {
++                        let h = (*p.add(11)).wrapping_sub(b'0') as i64 * 10
++                            + (*p.add(12)).wrapping_sub(b'0') as i64;
++                        let mi = (*p.add(14)).wrapping_sub(b'0') as i64 * 10
++                            + (*p.add(15)).wrapping_sub(b'0') as i64;
++                        let s = (*p.add(17)).wrapping_sub(b'0') as i64 * 10
++                            + (*p.add(18)).wrapping_sub(b'0') as i64;
++                        return Some(slot.day_ms + (h * 3600 + mi * 60 + s) * 1000);
++                    }
++                }
++            }
++        }
++        parse_f1_fast(b)
++    }
++
++    #[inline(always)]
++    pub fn parse_ts(&self, b: &[u8]) -> Option<i64> {
++        let n = b.len();
++        if n == 20 && unsafe { *b.get_unchecked(19) } == b'Z' {
++            return self.calendar_cached(b);
++        }
++        if n == 13 {
++            return parse_f3_13(b);
++        }
++        if n == 25 {
++            let p = b.as_ptr();
++            unsafe {
++                let sign = *p.add(19);
++                if *p.add(22) == b':' && (sign == b'+' || sign == b'-') {
++                    let base = self.calendar_cached(b)?;
++                    let h0 = (*p.add(20)).wrapping_sub(b'0');
++                    let h1 = (*p.add(21)).wrapping_sub(b'0');
++                    let m0 = (*p.add(23)).wrapping_sub(b'0');
++                    let m1 = (*p.add(24)).wrapping_sub(b'0');
++                    if ((non_digit_bits(h0) | non_digit_bits(h1) | non_digit_bits(m0) | non_digit_bits(m1)) & 0xF0)
++                        != 0
++                    {
++                        return None;
++                    }
++                    let oh = h0 as u32 * 10 + h1 as u32;
++                    let om = m0 as u32 * 10 + m1 as u32;
++                    if oh > 23 || om > 59 {
++                        return None;
++                    }
++                    let off = (oh as i64 * 60 + om as i64) * 60_000;
++                    return Some(if sign == b'+' { base - off } else { base + off });
++                }
++            }
++        }
++        parse_f3_general(b)
++    }
++}
++
++#[inline(always)]
++fn parse_f3_13(b: &[u8]) -> Option<i64> {
++    let p = b.as_ptr();
++    unsafe {
++        let d0 = (*p).wrapping_sub(b'0');
++        let d1 = (*p.add(1)).wrapping_sub(b'0');
++        let d2 = (*p.add(2)).wrapping_sub(b'0');
++        let d3 = (*p.add(3)).wrapping_sub(b'0');
++        let d4 = (*p.add(4)).wrapping_sub(b'0');
++        let d5 = (*p.add(5)).wrapping_sub(b'0');
++        let d6 = (*p.add(6)).wrapping_sub(b'0');
++        let d7 = (*p.add(7)).wrapping_sub(b'0');
++        let d8 = (*p.add(8)).wrapping_sub(b'0');
++        let d9 = (*p.add(9)).wrapping_sub(b'0');
++        let d10 = (*p.add(10)).wrapping_sub(b'0');
++        let d11 = (*p.add(11)).wrapping_sub(b'0');
++        let d12 = (*p.add(12)).wrapping_sub(b'0');
++        let bad = non_digit_bits(d0)
++            | non_digit_bits(d1)
++            | non_digit_bits(d2)
++            | non_digit_bits(d3)
++            | non_digit_bits(d4)
++            | non_digit_bits(d5)
++            | non_digit_bits(d6)
++            | non_digit_bits(d7)
++            | non_digit_bits(d8)
++            | non_digit_bits(d9)
++            | non_digit_bits(d10)
++            | non_digit_bits(d11)
++            | non_digit_bits(d12);
++        if (bad & 0xF0) != 0 {
++            return None;
++        }
++        let hi = (d0 as u64 * 100_000
++            + d1 as u64 * 10_000
++            + d2 as u64 * 1_000
++            + d3 as u64 * 100
++            + d4 as u64 * 10
++            + d5 as u64)
++            * 10_000_000;
++        let lo = d6 as u64 * 1_000_000
++            + d7 as u64 * 100_000
++            + d8 as u64 * 10_000
++            + d9 as u64 * 1_000
++            + d10 as u64 * 100
++            + d11 as u64 * 10
++            + d12 as u64;
++        Some((hi + lo) as i64)
++    }
++}
++
+ /// Returns epoch ms, or None for a bad timestamp. A digits-only value too large
+ /// for i64 is returned as i64::MAX (valid form, outside every window).
+ #[inline(always)]
+@@ -177,54 +377,7 @@ pub fn parse_ts(b: &[u8]) -> Option<i64> {
+         return calendar(b);
+     }
+     if n == 13 {
+-        // Fast unrolled 13-digit epoch ms (F3: e.g. 1791071890000).
+-        let p = b.as_ptr();
+-        unsafe {
+-            let d0 = (*p).wrapping_sub(b'0');
+-            let d1 = (*p.add(1)).wrapping_sub(b'0');
+-            let d2 = (*p.add(2)).wrapping_sub(b'0');
+-            let d3 = (*p.add(3)).wrapping_sub(b'0');
+-            let d4 = (*p.add(4)).wrapping_sub(b'0');
+-            let d5 = (*p.add(5)).wrapping_sub(b'0');
+-            let d6 = (*p.add(6)).wrapping_sub(b'0');
+-            let d7 = (*p.add(7)).wrapping_sub(b'0');
+-            let d8 = (*p.add(8)).wrapping_sub(b'0');
+-            let d9 = (*p.add(9)).wrapping_sub(b'0');
+-            let d10 = (*p.add(10)).wrapping_sub(b'0');
+-            let d11 = (*p.add(11)).wrapping_sub(b'0');
+-            let d12 = (*p.add(12)).wrapping_sub(b'0');
+-            let bad = non_digit_bits(d0)
+-                | non_digit_bits(d1)
+-                | non_digit_bits(d2)
+-                | non_digit_bits(d3)
+-                | non_digit_bits(d4)
+-                | non_digit_bits(d5)
+-                | non_digit_bits(d6)
+-                | non_digit_bits(d7)
+-                | non_digit_bits(d8)
+-                | non_digit_bits(d9)
+-                | non_digit_bits(d10)
+-                | non_digit_bits(d11)
+-                | non_digit_bits(d12);
+-            if (bad & 0xF0) != 0 {
+-                return None;
+-            }
+-            let hi = (d0 as u64 * 100_000
+-                + d1 as u64 * 10_000
+-                + d2 as u64 * 1_000
+-                + d3 as u64 * 100
+-                + d4 as u64 * 10
+-                + d5 as u64)
+-                * 10_000_000;
+-            let lo = d6 as u64 * 1_000_000
+-                + d7 as u64 * 100_000
+-                + d8 as u64 * 10_000
+-                + d9 as u64 * 1_000
+-                + d10 as u64 * 100
+-                + d11 as u64 * 10
+-                + d12 as u64;
+-            return Some((hi + lo) as i64);
+-        }
++        return parse_f3_13(b);
+     }
+     if n == 25 {
+         let p = b.as_ptr();
