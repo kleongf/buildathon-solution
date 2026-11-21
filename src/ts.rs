@@ -168,6 +168,206 @@ pub fn parse_f1_fast(b: &[u8]) -> Option<i64> {
     parse_ts(b)
 }
 
+/// Direct-mapped 32-slot L1 date-prefix cache indexed by day-of-month (`1..=31`).
+/// For any <=27-day window (14d window + 7d click lookback + 6d late ingest), every
+/// calendar day-of-month is unique, so 100% of in-window F1/F2 dates hit with a
+/// single u64 prefix compare (`"YYYY-MM-"`) and skip all calendar/leap math.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct DateSlot {
+    prefix: u64, // little-endian 8 bytes "YYYY-MM-"; 0 = empty
+    day_ms: i64,
+}
+
+pub struct DateCache {
+    slots: [DateSlot; 32],
+}
+
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (y + i64::from(m <= 2), m as u32, d as u32)
+}
+
+impl DateCache {
+    pub fn new(ws: i64, we: i64) -> DateCache {
+        let mut slots = [DateSlot { prefix: 0, day_ms: 0 }; 32];
+        let d_start = (ws - 8 * DAY_MS).div_euclid(DAY_MS);
+        let d_end = (we + 6 * DAY_MS).div_euclid(DAY_MS);
+        let count = (d_end - d_start + 1).clamp(0, 28);
+        for off in 0..count {
+            let day = d_start + off;
+            let (y, m, d) = civil_from_days(day);
+            if y >= 1 && y <= 9999 && d >= 1 && d <= 31 {
+                let s = format!("{y:04}-{m:02}-");
+                let prefix = u64::from_le_bytes(s.as_bytes()[0..8].try_into().unwrap());
+                slots[d as usize] = DateSlot { prefix, day_ms: day * DAY_MS };
+            }
+        }
+        DateCache { slots }
+    }
+
+    #[inline(always)]
+    fn calendar_cached(&self, b: &[u8]) -> Option<i64> {
+        let p = b.as_ptr();
+        unsafe {
+            let d0 = (*p.add(8)).wrapping_sub(b'0');
+            let d1 = (*p.add(9)).wrapping_sub(b'0');
+            let d = (d0 as u32 * 10 + d1 as u32) as usize;
+            if ((non_digit_bits(d0) | non_digit_bits(d1)) & 0xF0) == 0 && d < 32 {
+                let slot = *self.slots.get_unchecked(d);
+                let pref = (p as *const u64).read_unaligned();
+                if pref == slot.prefix
+                    && ((*p.add(10) ^ b'T') | (*p.add(13) ^ b':') | (*p.add(16) ^ b':')) == 0
+                {
+                    let h0 = (*p.add(11)).wrapping_sub(b'0');
+                    let h1 = (*p.add(12)).wrapping_sub(b'0');
+                    let n0 = (*p.add(14)).wrapping_sub(b'0');
+                    let n1 = (*p.add(15)).wrapping_sub(b'0');
+                    let s0 = (*p.add(17)).wrapping_sub(b'0');
+                    let s1 = (*p.add(18)).wrapping_sub(b'0');
+                    let bad = non_digit_bits(h0)
+                        | non_digit_bits(h1)
+                        | non_digit_bits(n0)
+                        | non_digit_bits(n1)
+                        | non_digit_bits(s0)
+                        | non_digit_bits(s1);
+                    if (bad & 0xF0) == 0 {
+                        let h = h0 as u32 * 10 + h1 as u32;
+                        let mi = n0 as u32 * 10 + n1 as u32;
+                        let s = s0 as u32 * 10 + s1 as u32;
+                        if h <= 23 && mi <= 59 && s <= 59 {
+                            return Some(slot.day_ms + (h as i64 * 3600 + mi as i64 * 60 + s as i64) * 1000);
+                        }
+                    }
+                    return None;
+                }
+            }
+        }
+        calendar(b)
+    }
+
+    /// Ultra-fast path for `ingest_ts` (guaranteed valid F1 per rules.md).
+    #[inline(always)]
+    pub fn parse_f1_ingest(&self, b: &[u8]) -> Option<i64> {
+        if b.len() == 20 {
+            let p = b.as_ptr();
+            unsafe {
+                let d = ((*p.add(8)).wrapping_sub(b'0') as usize) * 10
+                    + (*p.add(9)).wrapping_sub(b'0') as usize;
+                if d < 32 {
+                    let slot = *self.slots.get_unchecked(d);
+                    if (p as *const u64).read_unaligned() == slot.prefix {
+                        let h = (*p.add(11)).wrapping_sub(b'0') as i64 * 10
+                            + (*p.add(12)).wrapping_sub(b'0') as i64;
+                        let mi = (*p.add(14)).wrapping_sub(b'0') as i64 * 10
+                            + (*p.add(15)).wrapping_sub(b'0') as i64;
+                        let s = (*p.add(17)).wrapping_sub(b'0') as i64 * 10
+                            + (*p.add(18)).wrapping_sub(b'0') as i64;
+                        return Some(slot.day_ms + (h * 3600 + mi * 60 + s) * 1000);
+                    }
+                }
+            }
+        }
+        parse_f1_fast(b)
+    }
+
+    #[inline(always)]
+    pub fn parse_ts(&self, b: &[u8]) -> Option<i64> {
+        let n = b.len();
+        if n == 20 && unsafe { *b.get_unchecked(19) } == b'Z' {
+            return self.calendar_cached(b);
+        }
+        if n == 13 {
+            return parse_f3_13(b);
+        }
+        if n == 25 {
+            let p = b.as_ptr();
+            unsafe {
+                let sign = *p.add(19);
+                if *p.add(22) == b':' && (sign == b'+' || sign == b'-') {
+                    let base = self.calendar_cached(b)?;
+                    let h0 = (*p.add(20)).wrapping_sub(b'0');
+                    let h1 = (*p.add(21)).wrapping_sub(b'0');
+                    let m0 = (*p.add(23)).wrapping_sub(b'0');
+                    let m1 = (*p.add(24)).wrapping_sub(b'0');
+                    if ((non_digit_bits(h0) | non_digit_bits(h1) | non_digit_bits(m0) | non_digit_bits(m1)) & 0xF0)
+                        != 0
+                    {
+                        return None;
+                    }
+                    let oh = h0 as u32 * 10 + h1 as u32;
+                    let om = m0 as u32 * 10 + m1 as u32;
+                    if oh > 23 || om > 59 {
+                        return None;
+                    }
+                    let off = (oh as i64 * 60 + om as i64) * 60_000;
+                    return Some(if sign == b'+' { base - off } else { base + off });
+                }
+            }
+        }
+        parse_f3_general(b)
+    }
+}
+
+#[inline(always)]
+fn parse_f3_13(b: &[u8]) -> Option<i64> {
+    let p = b.as_ptr();
+    unsafe {
+        let d0 = (*p).wrapping_sub(b'0');
+        let d1 = (*p.add(1)).wrapping_sub(b'0');
+        let d2 = (*p.add(2)).wrapping_sub(b'0');
+        let d3 = (*p.add(3)).wrapping_sub(b'0');
+        let d4 = (*p.add(4)).wrapping_sub(b'0');
+        let d5 = (*p.add(5)).wrapping_sub(b'0');
+        let d6 = (*p.add(6)).wrapping_sub(b'0');
+        let d7 = (*p.add(7)).wrapping_sub(b'0');
+        let d8 = (*p.add(8)).wrapping_sub(b'0');
+        let d9 = (*p.add(9)).wrapping_sub(b'0');
+        let d10 = (*p.add(10)).wrapping_sub(b'0');
+        let d11 = (*p.add(11)).wrapping_sub(b'0');
+        let d12 = (*p.add(12)).wrapping_sub(b'0');
+        let bad = non_digit_bits(d0)
+            | non_digit_bits(d1)
+            | non_digit_bits(d2)
+            | non_digit_bits(d3)
+            | non_digit_bits(d4)
+            | non_digit_bits(d5)
+            | non_digit_bits(d6)
+            | non_digit_bits(d7)
+            | non_digit_bits(d8)
+            | non_digit_bits(d9)
+            | non_digit_bits(d10)
+            | non_digit_bits(d11)
+            | non_digit_bits(d12);
+        if (bad & 0xF0) != 0 {
+            return None;
+        }
+        let hi = (d0 as u64 * 100_000
+            + d1 as u64 * 10_000
+            + d2 as u64 * 1_000
+            + d3 as u64 * 100
+            + d4 as u64 * 10
+            + d5 as u64)
+            * 10_000_000;
+        let lo = d6 as u64 * 1_000_000
+            + d7 as u64 * 100_000
+            + d8 as u64 * 10_000
+            + d9 as u64 * 1_000
+            + d10 as u64 * 100
+            + d11 as u64 * 10
+            + d12 as u64;
+        Some((hi + lo) as i64)
+    }
+}
+
 /// Returns epoch ms, or None for a bad timestamp. A digits-only value too large
 /// for i64 is returned as i64::MAX (valid form, outside every window).
 #[inline(always)]
@@ -177,54 +377,7 @@ pub fn parse_ts(b: &[u8]) -> Option<i64> {
         return calendar(b);
     }
     if n == 13 {
-        // Fast unrolled 13-digit epoch ms (F3: e.g. 1791071890000).
-        let p = b.as_ptr();
-        unsafe {
-            let d0 = (*p).wrapping_sub(b'0');
-            let d1 = (*p.add(1)).wrapping_sub(b'0');
-            let d2 = (*p.add(2)).wrapping_sub(b'0');
-            let d3 = (*p.add(3)).wrapping_sub(b'0');
-            let d4 = (*p.add(4)).wrapping_sub(b'0');
-            let d5 = (*p.add(5)).wrapping_sub(b'0');
-            let d6 = (*p.add(6)).wrapping_sub(b'0');
-            let d7 = (*p.add(7)).wrapping_sub(b'0');
-            let d8 = (*p.add(8)).wrapping_sub(b'0');
-            let d9 = (*p.add(9)).wrapping_sub(b'0');
-            let d10 = (*p.add(10)).wrapping_sub(b'0');
-            let d11 = (*p.add(11)).wrapping_sub(b'0');
-            let d12 = (*p.add(12)).wrapping_sub(b'0');
-            let bad = non_digit_bits(d0)
-                | non_digit_bits(d1)
-                | non_digit_bits(d2)
-                | non_digit_bits(d3)
-                | non_digit_bits(d4)
-                | non_digit_bits(d5)
-                | non_digit_bits(d6)
-                | non_digit_bits(d7)
-                | non_digit_bits(d8)
-                | non_digit_bits(d9)
-                | non_digit_bits(d10)
-                | non_digit_bits(d11)
-                | non_digit_bits(d12);
-            if (bad & 0xF0) != 0 {
-                return None;
-            }
-            let hi = (d0 as u64 * 100_000
-                + d1 as u64 * 10_000
-                + d2 as u64 * 1_000
-                + d3 as u64 * 100
-                + d4 as u64 * 10
-                + d5 as u64)
-                * 10_000_000;
-            let lo = d6 as u64 * 1_000_000
-                + d7 as u64 * 100_000
-                + d8 as u64 * 10_000
-                + d9 as u64 * 1_000
-                + d10 as u64 * 100
-                + d11 as u64 * 10
-                + d12 as u64;
-            return Some((hi + lo) as i64);
-        }
+        return parse_f3_13(b);
     }
     if n == 25 {
         let p = b.as_ptr();

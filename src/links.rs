@@ -14,14 +14,13 @@ use crate::key::Key16;
 use crate::{csv, make_chunks, chunk_target, par, populate, release_chunk, SyncPtr};
 
 pub const SEED_L: u64 = 0x9e37_79b9_7f4a_7c15;
-pub const SEED_A: u64 = 0x2d35_8dcc_aa6c_78a5;
+pub const SEED_A: u64 = SEED_L;
 
 const REGION_BITS: u32 = 8;
 const REGIONS: usize = 1 << REGION_BITS;
 /// Link-side shards for interning (each holds at least one 2 MB block).
 const SIDE_BITS: u32 = 6;
 const SIDE_SHARDS: usize = 1 << SIDE_BITS;
-const BLOOM_WORDS: usize = 1 << 18; // 1 << 24 bits = 2 MB
 
 #[derive(Clone, Copy)]
 #[repr(C, align(32))]
@@ -36,11 +35,12 @@ pub struct LinkTable {
     tab: Vec<LEnt>,
     rbits: u32, // log2 slots per region
     bloom: Vec<u64>,
+    bloom_mask: usize,
 }
 
 #[inline(always)]
-fn bloom_word(h: u64) -> usize {
-    ((h >> 38) as usize) & (BLOOM_WORDS - 1)
+fn bloom_word(h: u64, mask: usize) -> usize {
+    ((h >> 32) as usize) & mask
 }
 #[inline(always)]
 fn bloom_bits(h: u64) -> u64 {
@@ -68,7 +68,7 @@ impl LinkTable {
     #[inline(always)]
     pub fn maybe(&self, h: u64) -> bool {
         let b = bloom_bits(h);
-        unsafe { *self.bloom.get_unchecked(bloom_word(h)) & b == b }
+        unsafe { *self.bloom.get_unchecked(bloom_word(h, self.bloom_mask)) & b == b }
     }
 
     #[inline(always)]
@@ -114,11 +114,11 @@ struct CEnt {
     phash: u64,
 }
 
-const CACHE: usize = 64;
+const CACHE: usize = 128;
 /// Items between the Bloom-word prefetch and the Bloom test.
-const RA: usize = 8;
+const RA: usize = 16;
 /// Items between the table-slot prefetch and the table probe.
-const RB: usize = 16;
+const RB: usize = 32;
 
 type Item<R> = (R, Key16, u64);
 
@@ -159,7 +159,7 @@ impl<'a, R: Copy> Resolver<'a, R> {
             emit(item, c.person, c.phash);
             return;
         }
-        prefetch(unsafe { self.lt.bloom.as_ptr().add(bloom_word(h)) } as *const u8);
+        prefetch(unsafe { self.lt.bloom.as_ptr().add(bloom_word(h, self.lt.bloom_mask)) } as *const u8);
         if self.at - self.ah == RA {
             let x = self.a[self.ah % RA];
             self.ah += 1;
@@ -173,7 +173,8 @@ impl<'a, R: Copy> Resolver<'a, R> {
     fn stage_b(&mut self, x: Item<R>, emit: &mut impl FnMut(R, Key16, u64)) {
         let (item, uid, h) = x;
         if !self.lt.maybe(h) {
-            emit(item, uid, uid.hash(SEED_A));
+            self.cache[(h as usize) & (CACHE - 1)] = CEnt { uid, person: uid, phash: h };
+            emit(item, uid, h);
             return;
         }
         self.lt.prefetch(h);
@@ -189,8 +190,10 @@ impl<'a, R: Copy> Resolver<'a, R> {
     #[inline(always)]
     fn finish_one(&mut self, y: Item<R>, emit: &mut impl FnMut(R, Key16, u64)) {
         let (item, uid, h) = y;
-        let person = self.lt.lookup(h, uid).unwrap_or(uid);
-        let phash = person.hash(SEED_A);
+        let (person, phash) = match self.lt.lookup(h, uid) {
+            Some(p) => (p, p.hash(SEED_A)),
+            None => (uid, h),
+        };
         self.cache[(h as usize) & (CACHE - 1)] = CEnt { uid, person, phash };
         emit(item, person, phash);
     }
@@ -223,7 +226,7 @@ struct LSide {
 pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
     let chunks = make_chunks(files, chunk_target(files, threads).min(1 << 20));
     let next = AtomicUsize::new(0);
-    let sides: ShardSet<LSide> = ShardSet::new(SIDE_SHARDS);
+    let sides: ShardSet<LSide> = ShardSet::new_shared(SIDE_SHARDS);
     // Per thread: number of edges.
     let edges: Vec<usize> = par(threads, |t| {
         let mut w = Scatter::new(&sides);
@@ -254,7 +257,15 @@ pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
     });
 
     // Intern per shard; record each endpoint's (shard, local node).
-    let mut eps: Vec<Vec<u64>> = edges.iter().map(|&e| vec![0u64; e * 2]).collect();
+    // Every slot in `eps` is written once before being read, so skip single-threaded zero-fill.
+    let mut eps: Vec<Vec<u64>> = edges
+        .iter()
+        .map(|&e| {
+            let mut v = Vec::with_capacity(e * 2);
+            unsafe { v.set_len(e * 2) };
+            v
+        })
+        .collect();
     let ep_ptrs: Vec<SyncPtr> = eps.iter_mut().map(|v| SyncPtr(v.as_mut_ptr())).collect();
     let next = AtomicUsize::new(0);
     let shard_keys: Vec<Vec<(usize, Vec<Key16>)>> = par(threads, |_| {
@@ -299,6 +310,7 @@ pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
         }
         res
     });
+    sides.free_all();
     let mut per_shard: Vec<Vec<Key16>> = (0..SIDE_SHARDS).map(|_| Vec::new()).collect();
     for (s, k) in shard_keys.into_iter().flatten() {
         per_shard[s] = k;
@@ -308,12 +320,37 @@ pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
         base[s + 1] = base[s] + per_shard[s].len() as u32;
     }
     let n = base[SIDE_SHARDS] as usize;
-    let keys: Vec<Key16> = per_shard.into_iter().flatten().collect();
+    let mut keys: Vec<Key16> = Vec::with_capacity(n);
+    unsafe { keys.set_len(n) };
+    let mut parent: Vec<AtomicU32> = Vec::with_capacity(n);
+    unsafe { parent.set_len(n) };
+    {
+        let kp = SyncPtr(keys.as_mut_ptr() as *mut u64);
+        let pp = SyncPtr(parent.as_mut_ptr() as *mut u64);
+        let kp = &kp;
+        let pp = &pp;
+        let per_shard = &per_shard;
+        let base = &base;
+        let step_s = SIDE_SHARDS.div_ceil(threads).max(1);
+        par(threads, |t| {
+            let kdst = kp.0 as *mut Key16;
+            let pdst = pp.0 as *mut AtomicU32;
+            for s in (t * step_s).min(SIDE_SHARDS)..((t + 1) * step_s).min(SIDE_SHARDS) {
+                let b = base[s] as usize;
+                let src = &per_shard[s];
+                if !src.is_empty() {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(src.as_ptr(), kdst.add(b), src.len());
+                    }
+                }
+                for i in b..b + src.len() {
+                    unsafe { pdst.add(i).write(AtomicU32::new(i as u32)) };
+                }
+            }
+        });
+    }
+    drop(per_shard);
     let keys = &keys;
-
-    // Lock-free union-find; every parent pointer goes to a byte-wise smaller ID,
-    // so each root is its component's smallest ID (the person name).
-    let parent: Vec<AtomicU32> = (0..n as u32).map(AtomicU32::new).collect();
     let parent = &parent;
     let less = |a: u32, b: u32| keys[a as usize].cmp_bytes(&keys[b as usize]) == std::cmp::Ordering::Less;
     let find = |mut x: u32| -> u32 {
@@ -382,10 +419,23 @@ pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
             counts[r] += v.len();
         }
     }
+    let total_nr: usize = counts.iter().sum();
+    let bloom_words = ((total_nr * 12 / 64).next_power_of_two()).clamp(1 << 10, 1 << 18);
+    let bloom_mask = bloom_words - 1;
     let maxc = counts.iter().copied().max().unwrap_or(0);
     let rbits = ((maxc + maxc / 2 + 1).next_power_of_two().max(4)).trailing_zeros();
     let mut tab = vec![LEMPTY; REGIONS << rbits];
-    let bloom: Vec<AtomicU64> = (0..BLOOM_WORDS).map(|_| AtomicU64::new(0)).collect();
+    #[cfg(target_os = "linux")]
+    if tab.len() * std::mem::size_of::<LEnt>() >= (2 << 20) {
+        unsafe {
+            libc::madvise(
+                tab.as_mut_ptr() as *mut libc::c_void,
+                tab.len() * std::mem::size_of::<LEnt>(),
+                libc::MADV_HUGEPAGE,
+            );
+        }
+    }
+    let bloom: Vec<AtomicU64> = (0..bloom_words).map(|_| AtomicU64::new(0)).collect();
     {
         let tp = SyncPtr(tab.as_mut_ptr() as *mut u64);
         let tp = &tp;
@@ -404,7 +454,7 @@ pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
                     let (root, x) = ((v >> 32) as usize, v as u32 as usize);
                     let key = keys[x];
                     let h = key.hash(SEED_L);
-                    bloom[bloom_word(h)].fetch_or(bloom_bits(h), Ordering::Relaxed);
+                    bloom[bloom_word(h, bloom_mask)].fetch_or(bloom_bits(h), Ordering::Relaxed);
                     let mut i = h as usize & rmask;
                     unsafe {
                         while (*tab.add((r << rbits) + i)).key.lo != 0 {
@@ -416,7 +466,7 @@ pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
             }
         });
     }
-    LinkTable { tab, rbits, bloom: bloom.into_iter().map(|a| a.into_inner()).collect() }
+    LinkTable { tab, rbits, bloom: bloom.into_iter().map(|a| a.into_inner()).collect(), bloom_mask }
 }
 
 #[cfg(test)]

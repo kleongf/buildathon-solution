@@ -244,6 +244,42 @@ unsafe fn scan_avx2<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(data: &'a [u8]
                     }
                     sm &= sm - 1;
                 }
+            } else if qcnt == 0 && sm != 0 && {
+                let lz = sm.leading_zeros();
+                let hi_mask = if lz == 0 { !0u64 } else { (1u64 << (64 - lz)) - 1 };
+                let valid_edge = (sm << 1) | ((fs == i) as u64) | (sm >> 1);
+                (qm & (!hi_mask | !valid_edge)) == 0
+            } {
+                // Fast edge-quoted path (>95% of quoted blocks): zero interior quotes,
+                // zero quotes carried in or out. Validate each field with 2 edge checks.
+                while sm != 0 {
+                    let b = sm.trailing_zeros();
+                    let pos = i + b as usize;
+                    let (f0, f1) = if pos == fs {
+                        (fs, pos)
+                    } else {
+                        let q0 = *p.add(fs) == b'"';
+                        let q1 = *p.add(pos - 1) == b'"';
+                        let quoted = q0 && q1 && pos > fs + 1;
+                        bad |= !((!q0 && !q1) || quoted);
+                        let qu = quoted as usize;
+                        (fs + qu, pos - qu)
+                    };
+                    *fields.get_unchecked_mut(nf.min(N)) = (f0, f1);
+                    nf += 1;
+                    fs = pos + 1;
+                    if (nlm >> b) & 1 != 0 {
+                        if !bad && nf == N {
+                            let arr: [&'a [u8]; N] = std::array::from_fn(|k| {
+                                data.get_unchecked(fields[k].0..fields[k].1)
+                            });
+                            f(&arr);
+                        }
+                        nf = 0;
+                        bad = false;
+                    }
+                    sm &= sm - 1;
+                }
             } else {
                 while sm != 0 {
                     let b = sm.trailing_zeros();

@@ -1,37 +1,22 @@
 # buildercomp native Rust candidate
 
-Imported from the `buildercomp` workspace (`opt-loop` branch). It is an independent native Rust pipeline with no shared code with `candidates/rust` or Alex. Its only dependency is `libc`.
+Auto-synced from the `buildercomp` workspace by `scripts/sync_kleong.py`. It is an independent native Rust pipeline with no shared code with `candidates/rust` or Alex; its only dependency is `libc`.
 
-| What | Commit | Status |
-|---|---|---|
-| `src/`, `Cargo.*`, `Dockerfile` | `d7e4761` (iter 2) | **Last benchmarked build.** 20M and 60M golden output MATCH (torture 7/7 and fixtures 36/36 were last recorded on iter 1) |
-| `patches/iter4-a4f1c35.patch` | `a4f1c35` (iter 4) | Latest code. Committed but **not yet benchmarked or validated**; don't submit it untested |
-| `patches/iter3-1af1f07-reverted.patch` | `1af1f07` (iter 3) | Rejected: no significant gain at 20M, regression at 60M. Kept for reference |
+**Current source: iter 5 (`1306817`)**, the newest kept build: 20M wall median **1443.4 ms**, -26.1% vs Alex's 1952 ms on the same rig. Notes: delta_wall=-57.9ms (-3.86%) ci95=[-73.2,-45.4]ms; 60M 4425->4199ms (-226ms, RSS 5314->4653MB MATCH); write 47->14ms (-69%), dedup 287->236ms (-51ms, 60M -219ms), links 114->102ms, RSS -663MB; NOTE clicks regressed +41ms (20M) / +135ms (60M) — diagnosing immediately!
 
-Apply iter 4 from the repo root:
+Rejected experiments are kept under `patches/`. Older kept builds are in this directory's git history.
 
-```sh
-git apply --directory=candidates/buildercomp candidates/buildercomp/patches/iter4-a4f1c35.patch
-```
+## Every iteration (20M, scorer-style Docker, 8 CPU / 24 GB, linux/amd64 Xeon VM)
 
-## Headline numbers (scorer-style Docker, 8 CPU / 24 GB, linux/amd64 Xeon VM)
+| Iter | Commit | Wall median | Verdict | Change |
+|---|---|---:|---|---|
+| 0 | `a427bc5` | 2702.1 ms | BASELINE | v1-baseline |
+| 1 | `3e5a056` | 2501.8 ms | WIN | 64B AVX2 CSV + 620B L1 calendar LUT + unrolled 13-digit F3 + fast F1 ingest_ts |
+| 2 | `d7e4761` | 1683.9 ms | WIN | Wave 1B: 2MB hugepage arenas + NT-store scatter + Key16 + L3 Bloom/L1 cache + fused dedup |
+| 3 | `1af1f07` | 1657.1 ms | REVERT | shared-block arena + P_SHARDS=128 + 32B PEv + NB=2048 + single-seed Bloom + exit(0) |
+| 4 | `e29a052` | 1516.1 ms | WIN | per-shard 32KB person interning + 8B Ev8 + 24B Cl24 solve, DateCache L1 timestamps, AVX2 edge-quote fast path, single-seed Bloom/whale cache, exit(0) |
+| 5 | `1306817` | 1443.4 ms | WIN | hybrid shared ShardSet, parallel links init, KeyMap, ID/P_SHARDS=512 + ehash/prefetch dedup, direct Parquet Column emit + zero-copy write, zero-div solve + packed u64 Ev8 sort |
 
-| | 20M wall median | 60M wall | Peak RSS (20M) |
-|---|---:|---:|---:|
-| Alex `2d9954b2` (same rig) | 1952 ms | 5757 ms | – |
-| **buildercomp iter 2** | **1684 ms** (−13.7% vs Alex) | **5056 ms** (−12.2%) | 2.45 GB |
+Alex `2d9954b2` on the same rig: 1952 ms at 20M, 5757 ms at 60M. Timing runs `docker run` with the scorer flags, timed from the container's `StartedAt` to `FinishedAt`, with paired AB/BA comparisons and a 95% confidence interval (`scripts/scorer_time.sh`). These numbers are **not** directly comparable to this repo's `research.benchmark` or AWS numbers; re-measure before promoting.
 
-Timing runs `docker run` with the scorer flags (read-only filesystem, no network, `--cpus 8 --memory 24g`, user 1000), timed from the container's `StartedAt` to `FinishedAt` via `docker inspect`. Each comparison is paired AB/BA with a bootstrap 95% confidence interval. See `scripts/scorer_time.sh`.
-
-These figures are **not** directly comparable to this repo's `research.benchmark` or AWS numbers, because the host and timing boundary differ. Re-measure under this repo's harness before promoting.
-
-## Layout
-
-- `src/csv.rs`: 64-byte AVX2 CSV scanner (quote-aware)
-- `src/ts.rs`: F1/F2/F3 timestamp parsing with an L1-sized calendar lookup table
-- `src/links.rs`: union-find over linked user IDs, a Bloom filter sized to fit L3, and a 128-entry cache for whale users
-- `src/key.rs`, `src/hash.rs`: exact 16-byte ID keys and hashing
-- `src/arena.rs`: pooled arenas on 2 MB hugepages
-- `src/main.rs`: fused parse → dedup → sessionize → attribute pipeline, using non-temporal-store scatter into 256 person shards
-- `src/parquet.rs`: minimal Parquet writer
-- `scripts/`: scorer-exact Docker timer (`scorer_time.sh`), torture and fuzz differential tests, and a Python reference oracle
+Findings and next experiments: [docs/buildercomp-findings.md](../../docs/buildercomp-findings.md).

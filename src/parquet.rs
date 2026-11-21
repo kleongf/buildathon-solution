@@ -36,17 +36,23 @@ impl Column {
         }
     }
 
-    #[inline]
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.n
+    }
+
+    #[inline(always)]
     fn push_def(&mut self, present: bool) {
-        if self.n % 8 == 0 {
+        if self.n & 7 == 0 {
             self.defs.push(0);
         }
         if present {
-            *self.defs.last_mut().unwrap() |= 1 << (self.n % 8);
+            let last = self.defs.len() - 1;
+            unsafe { *self.defs.get_unchecked_mut(last) |= 1 << (self.n & 7) };
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn push_str(&mut self, s: &[u8]) {
         debug_assert!(self.kind == Kind::Str);
         self.values.extend_from_slice(&(s.len() as u32).to_le_bytes());
@@ -54,7 +60,7 @@ impl Column {
         self.n += 1;
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn push_opt_str(&mut self, s: Option<&[u8]>) {
         debug_assert!(self.kind == Kind::OptStr);
         self.push_def(s.is_some());
@@ -65,13 +71,13 @@ impl Column {
         self.n += 1;
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn push_date(&mut self, d: i32) {
         self.values.extend_from_slice(&d.to_le_bytes());
         self.n += 1;
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn push_i64(&mut self, v: i64) {
         self.values.extend_from_slice(&v.to_le_bytes());
         self.n += 1;
@@ -152,13 +158,15 @@ fn physical(kind: Kind) -> i32 {
     }
 }
 
-/// Writes a Parquet file holding `cols` (all with the same row count).
+/// Writes a Parquet file holding `cols` (all with the same row count) directly
+/// without copying column buffers into an intermediate file-sized `Vec<u8>`.
 pub fn write_file(path: &Path, cols: &[Column]) -> std::io::Result<()> {
     let nrows = cols.first().map(|c| c.n).unwrap_or(0);
-    let mut out: Vec<u8> = Vec::with_capacity(cols.iter().map(|c| c.values.len() + c.defs.len() + 64).sum::<usize>() + 4096);
-    out.extend_from_slice(b"PAR1");
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(b"PAR1")?;
+    let mut off = 4i64;
     // (data_page_offset, total size)
-    let mut chunks: Vec<(i64, i64)> = Vec::new();
+    let mut chunks: Vec<(i64, i64)> = Vec::with_capacity(cols.len());
     if nrows > 0 {
         for c in cols {
             assert_eq!(c.n, nrows);
@@ -194,11 +202,16 @@ pub fn write_file(path: &Path, cols: &[Column]) -> std::io::Result<()> {
             t.i32(4, 3); // RLE
             t.end_struct();
             t.buf.push(0);
-            let off = out.len() as i64;
-            out.extend_from_slice(&t.buf);
-            out.extend_from_slice(&page);
-            out.extend_from_slice(&c.values);
-            chunks.push((off, out.len() as i64 - off));
+            let chunk_size = (t.buf.len() + page.len() + c.values.len()) as i64;
+            f.write_all(&t.buf)?;
+            if !page.is_empty() {
+                f.write_all(&page)?;
+            }
+            if !c.values.is_empty() {
+                f.write_all(&c.values)?;
+            }
+            chunks.push((off, chunk_size));
+            off += chunk_size;
         }
     }
 
@@ -268,10 +281,9 @@ pub fn write_file(path: &Path, cols: &[Column]) -> std::io::Result<()> {
     }
     t.bin(6, b"shopping-sessions");
     t.buf.push(0);
-    out.extend_from_slice(&t.buf);
-    out.extend_from_slice(&(t.buf.len() as u32).to_le_bytes());
-    out.extend_from_slice(b"PAR1");
-    let mut f = std::fs::File::create(path)?;
-    f.write_all(&out)?;
+    let flen = (t.buf.len() as u32).to_le_bytes();
+    t.buf.extend_from_slice(&flen);
+    t.buf.extend_from_slice(b"PAR1");
+    f.write_all(&t.buf)?;
     Ok(())
 }

@@ -134,8 +134,15 @@ struct ShardState {
     segs: Vec<Seg>,
 }
 
+struct SharedCursor {
+    blocks: Vec<usize>,
+    cur_block: usize,
+    next_seg: usize,
+}
+
 pub struct ShardSet<T> {
     shards: Vec<Mutex<ShardState>>,
+    shared: Option<Mutex<SharedCursor>>,
     _t: PhantomData<T>,
 }
 
@@ -170,12 +177,30 @@ impl<T: Copy> Segs<T> {
 }
 
 impl<T: Copy> ShardSet<T> {
+    /// Per-shard 2 MB blocks: each shard owns its own blocks and returns them
+    /// immediately on `Segs::free()` (ideal for large phases whose freed blocks
+    /// are reused incrementally by the next phase).
     pub fn new(n: usize) -> ShardSet<T> {
         assert!(SEG % std::mem::size_of::<T>() == 0);
         ShardSet {
             shards: (0..n)
                 .map(|_| Mutex::new(ShardState { blocks: Vec::new(), next_seg: SEGS_PER_BLOCK, segs: Vec::new() }))
                 .collect(),
+            shared: None,
+            _t: PhantomData,
+        }
+    }
+
+    /// Shared 2 MB blocks carved into 16 KB segments across all shards: avoids
+    /// wasting half-empty 2 MB blocks when per-shard volume is < 2 MB.
+    /// Call `free_all()` after consuming all shards.
+    pub fn new_shared(n: usize) -> ShardSet<T> {
+        assert!(SEG % std::mem::size_of::<T>() == 0);
+        ShardSet {
+            shards: (0..n)
+                .map(|_| Mutex::new(ShardState { blocks: Vec::new(), next_seg: SEGS_PER_BLOCK, segs: Vec::new() }))
+                .collect(),
+            shared: Some(Mutex::new(SharedCursor { blocks: Vec::new(), cur_block: 0, next_seg: SEGS_PER_BLOCK })),
             _t: PhantomData,
         }
     }
@@ -186,6 +211,26 @@ impl<T: Copy> ShardSet<T> {
 
     /// Records the finished segment `done` (if any) and claims a fresh one.
     fn swap_seg(&self, s: usize, done: Option<Seg>, want_new: bool) -> usize {
+        if let Some(ref sc) = self.shared {
+            if let Some(d) = done {
+                if d.n > 0 {
+                    self.shards[s].lock().unwrap().segs.push(d);
+                }
+            }
+            if !want_new {
+                return 0;
+            }
+            let mut c = sc.lock().unwrap();
+            if c.next_seg == SEGS_PER_BLOCK {
+                let b = get_block() as usize;
+                c.blocks.push(b);
+                c.cur_block = b;
+                c.next_seg = 0;
+            }
+            let p = c.cur_block + c.next_seg * SEG;
+            c.next_seg += 1;
+            return p;
+        }
         let mut g = self.shards[s].lock().unwrap();
         if let Some(d) = done {
             if d.n > 0 {
@@ -215,6 +260,18 @@ impl<T: Copy> ShardSet<T> {
         let mut g = self.shards[s].lock().unwrap();
         g.next_seg = SEGS_PER_BLOCK;
         Segs { segs: std::mem::take(&mut g.segs), blocks: std::mem::take(&mut g.blocks), _t: PhantomData }
+    }
+
+    /// Returns all remaining blocks (including shared blocks) to the pool.
+    pub fn free_all(self) {
+        if let Some(sc) = self.shared {
+            let blocks = sc.into_inner().unwrap().blocks;
+            put_blocks(&blocks);
+        }
+        for sh in self.shards {
+            let blocks = sh.into_inner().unwrap().blocks;
+            put_blocks(&blocks);
+        }
     }
 }
 
@@ -449,6 +506,28 @@ mod tests {
             segs.free();
         }
         assert_eq!(n, 100_000);
+        assert_eq!(mapped_bytes(), before);
+
+        // Shared-block ShardSet reuses blocks and returns all of them on free_all().
+        let set3: ShardSet<R24> = ShardSet::new_shared(64);
+        let mut w3 = Scatter::new(&set3);
+        for i in 0..50_000u64 {
+            w3.push((i % 64) as usize, R24 { a: i, b: !i, c: i ^ 9 });
+        }
+        w3.finish();
+        let mut n3 = 0;
+        for sh in 0..64 {
+            let segs = set3.take(sh);
+            for seg in segs.iter() {
+                for r in seg {
+                    assert_eq!((r.b, r.c, r.a % 64), (!r.a, r.a ^ 9, sh as u64));
+                    n3 += 1;
+                }
+            }
+            segs.free();
+        }
+        set3.free_all();
+        assert_eq!(n3, 50_000);
         assert_eq!(mapped_bytes(), before);
     }
 }
