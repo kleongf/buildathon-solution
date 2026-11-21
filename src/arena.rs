@@ -134,15 +134,9 @@ struct ShardState {
     segs: Vec<Seg>,
 }
 
-struct SharedCursor {
-    blocks: Vec<usize>,
-    cur_block: usize,
-    next_seg: usize,
-}
-
 pub struct ShardSet<T> {
     shards: Vec<Mutex<ShardState>>,
-    shared: Option<Mutex<SharedCursor>>,
+    shared_blocks: Option<Mutex<Vec<usize>>>,
     _t: PhantomData<T>,
 }
 
@@ -186,51 +180,49 @@ impl<T: Copy> ShardSet<T> {
             shards: (0..n)
                 .map(|_| Mutex::new(ShardState { blocks: Vec::new(), next_seg: SEGS_PER_BLOCK, segs: Vec::new() }))
                 .collect(),
-            shared: None,
+            shared_blocks: None,
             _t: PhantomData,
         }
     }
 
-    /// Shared 2 MB blocks carved into 16 KB segments across all shards: avoids
-    /// wasting half-empty 2 MB blocks when per-shard volume is < 2 MB.
-    /// Call `free_all()` after consuming all shards.
+    /// Thread-local 2 MB blocks carved into 16 KB segments with zero cross-thread
+    /// cursor locking or THP page-fault contention: avoids wasting half-empty 2 MB
+    /// blocks per shard when per-shard volume is < 2 MB. Call `free_all()` after
+    /// consuming all shards.
     pub fn new_shared(n: usize) -> ShardSet<T> {
         assert!(SEG % std::mem::size_of::<T>() == 0);
         ShardSet {
             shards: (0..n)
                 .map(|_| Mutex::new(ShardState { blocks: Vec::new(), next_seg: SEGS_PER_BLOCK, segs: Vec::new() }))
                 .collect(),
-            shared: Some(Mutex::new(SharedCursor { blocks: Vec::new(), cur_block: 0, next_seg: SEGS_PER_BLOCK })),
+            shared_blocks: Some(Mutex::new(Vec::new())),
             _t: PhantomData,
         }
+    }
+
+    #[inline(always)]
+    fn is_shared(&self) -> bool {
+        self.shared_blocks.is_some()
     }
 
     pub fn len(&self) -> usize {
         self.shards.len()
     }
 
-    /// Records the finished segment `done` (if any) and claims a fresh one.
-    fn swap_seg(&self, s: usize, done: Option<Seg>, want_new: bool) -> usize {
-        if let Some(ref sc) = self.shared {
-            if let Some(d) = done {
-                if d.n > 0 {
-                    self.shards[s].lock().unwrap().segs.push(d);
-                }
-            }
-            if !want_new {
-                return 0;
-            }
-            let mut c = sc.lock().unwrap();
-            if c.next_seg == SEGS_PER_BLOCK {
-                let b = get_block() as usize;
-                c.blocks.push(b);
-                c.cur_block = b;
-                c.next_seg = 0;
-            }
-            let p = c.cur_block + c.next_seg * SEG;
-            c.next_seg += 1;
-            return p;
+    fn push_seg(&self, s: usize, done: Seg) {
+        if done.n > 0 {
+            self.shards[s].lock().unwrap().segs.push(done);
         }
+    }
+
+    fn register_shared_blocks(&self, blocks: &[usize]) {
+        if let Some(ref sb) = self.shared_blocks {
+            sb.lock().unwrap().extend_from_slice(blocks);
+        }
+    }
+
+    /// Records the finished segment `done` (if any) and claims a fresh one (per-shard mode).
+    fn swap_seg(&self, s: usize, done: Option<Seg>, want_new: bool) -> usize {
         let mut g = self.shards[s].lock().unwrap();
         if let Some(d) = done {
             if d.n > 0 {
@@ -264,8 +256,8 @@ impl<T: Copy> ShardSet<T> {
 
     /// Returns all remaining blocks (including shared blocks) to the pool.
     pub fn free_all(self) {
-        if let Some(sc) = self.shared {
-            let blocks = sc.into_inner().unwrap().blocks;
+        if let Some(sb) = self.shared_blocks {
+            let blocks = sb.into_inner().unwrap();
             put_blocks(&blocks);
         }
         for sh in self.shards {
@@ -304,6 +296,10 @@ pub struct Scatter<'a, T: Copy> {
     stage: Vec<Line>,
     cur: Vec<Cur>,
     nt: bool,
+    shared: bool,
+    local_block: usize,
+    local_next_seg: usize,
+    local_blocks: Vec<usize>,
 }
 
 impl<'a, T: Copy> Scatter<'a, T> {
@@ -319,7 +315,24 @@ impl<'a, T: Copy> Scatter<'a, T> {
             stage: vec![Line([0; 64]); n * Self::LINES],
             cur: vec![Cur { ptr: 0, off: 0, fill: 0 }; n],
             nt: nt_enabled(),
+            shared: set.is_shared(),
+            local_block: 0,
+            local_next_seg: SEGS_PER_BLOCK,
+            local_blocks: Vec::new(),
         }
+    }
+
+    #[inline(always)]
+    fn alloc_local_seg(&mut self) -> usize {
+        if self.local_next_seg == SEGS_PER_BLOCK {
+            let b = get_block() as usize;
+            self.local_blocks.push(b);
+            self.local_block = b;
+            self.local_next_seg = 0;
+        }
+        let p = self.local_block + self.local_next_seg * SEG;
+        self.local_next_seg += 1;
+        p
     }
 
     #[inline(always)]
@@ -340,8 +353,15 @@ impl<'a, T: Copy> Scatter<'a, T> {
         let c = self.cur[s];
         let (mut ptr, mut off) = (c.ptr, c.off as usize);
         if ptr == 0 || off == SEG {
-            let done = if ptr == 0 { None } else { Some(Seg { ptr, n: (SEG / Self::SZ) as u32 }) };
-            ptr = self.set.swap_seg(s, done, true);
+            if self.shared {
+                if ptr != 0 {
+                    self.set.push_seg(s, Seg { ptr, n: (SEG / Self::SZ) as u32 });
+                }
+                ptr = self.alloc_local_seg();
+            } else {
+                let done = if ptr == 0 { None } else { Some(Seg { ptr, n: (SEG / Self::SZ) as u32 }) };
+                ptr = self.set.swap_seg(s, done, true);
+            }
             off = 0;
         }
         let src = unsafe { self.stage.as_ptr().add(s * Self::LINES) } as *const u8;
@@ -356,8 +376,15 @@ impl<'a, T: Copy> Scatter<'a, T> {
             let (mut ptr, mut off) = (c.ptr, c.off as usize);
             if c.fill > 0 {
                 if ptr == 0 || off == SEG {
-                    let done = if ptr == 0 { None } else { Some(Seg { ptr, n: (SEG / Self::SZ) as u32 }) };
-                    ptr = self.set.swap_seg(s, done, true);
+                    if self.shared {
+                        if ptr != 0 {
+                            self.set.push_seg(s, Seg { ptr, n: (SEG / Self::SZ) as u32 });
+                        }
+                        ptr = self.alloc_local_seg();
+                    } else {
+                        let done = if ptr == 0 { None } else { Some(Seg { ptr, n: (SEG / Self::SZ) as u32 }) };
+                        ptr = self.set.swap_seg(s, done, true);
+                    }
                     off = 0;
                 }
                 let bytes = c.fill as usize * Self::SZ;
@@ -368,11 +395,18 @@ impl<'a, T: Copy> Scatter<'a, T> {
                 off += bytes;
             }
             if ptr != 0 {
-                self.set.swap_seg(s, Some(Seg { ptr, n: (off / Self::SZ) as u32 }), false);
+                if self.shared {
+                    self.set.push_seg(s, Seg { ptr, n: (off / Self::SZ) as u32 });
+                } else {
+                    self.set.swap_seg(s, Some(Seg { ptr, n: (off / Self::SZ) as u32 }), false);
+                }
             }
             self.cur[s] = Cur { ptr: 0, off: 0, fill: 0 };
         }
         sfence();
+        if !self.local_blocks.is_empty() {
+            self.set.register_shared_blocks(&self.local_blocks);
+        }
         self.stage = Vec::new();
     }
 }

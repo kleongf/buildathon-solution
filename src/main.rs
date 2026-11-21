@@ -378,7 +378,6 @@ struct Ctx {
     camps: KeyMap,
     camp_ids: Vec<&'static [u8]>,
     camp_channels: Vec<&'static [u8]>,
-    links: LinkTable,
 }
 
 /// Dedup-table slot: a short tag of the event_id hash plus 1 + record index.
@@ -1134,12 +1133,6 @@ fn main() {
     let link_files = map_dir(&data_dir.join("links"));
     let click_files = map_dir(&data_dir.join("clicks"));
     let event_files = map_dir(&data_dir.join("events"));
-    mark("init", &mut marks);
-
-    // ---- links
-    let links = links::build_links(&link_files, threads);
-    mark("links", &mut marks);
-
     let wide = cat_names.len() > 256;
     let ctx = Ctx {
         ws,
@@ -1155,50 +1148,14 @@ fn main() {
         camps,
         camp_ids,
         camp_channels,
-        links,
     };
     let ctx = &ctx;
+    mark("init", &mut marks);
 
-    // ---- clicks: parse, validate, resolve person, scatter by person
-    let cws = ws - SEVEN_DAYS_MS;
-    let chunks = make_chunks(&click_files, chunk_target(&click_files, threads));
-    let click_set: ShardSet<Click> = ShardSet::new_shared(P_SHARDS);
-    let next = AtomicUsize::new(0);
-    par(threads, |_| {
-        let mut w = Scatter::new(&click_set);
-        let zero = Click { person: Key16::EMPTY, cid: Key16::EMPTY, phash: 0, ts: 0, camp: 0 };
-        let mut res = Resolver::new(&ctx.links, zero);
-        let mut emit = |mut c: Click, person: Key16, phash: u64| {
-            c.person = person;
-            c.phash = phash;
-            w.push((phash >> (64 - P_BITS)) as usize, c);
-        };
-        loop {
-            let i = next.fetch_add(1, Ordering::Relaxed);
-            if i >= chunks.len() {
-                break;
-            }
-            let d = chunks[i].data;
-            populate(d);
-            csv::scan::<4, _>(d, |f| {
-                let (cid, uid) = (f[0], f[1]);
-                if cid.is_empty() || uid.is_empty() {
-                    return;
-                }
-                let Some(camp) = ctx.camps.get(f[2]) else { return };
-                let ts = match ctx.dates.parse_ts(f[3]) {
-                    Some(t) if t >= cws && t < ctx.we => t,
-                    _ => return,
-                };
-                let c = Click { person: Key16::EMPTY, cid: Key16::new(cid), phash: 0, ts: (ts - ctx.base) as u32, camp };
-                res.push(c, Key16::new(uid), &mut emit);
-            });
-            release_chunk(d);
-        }
-        res.drain(&mut emit);
-        w.finish();
-    });
-    mark("clicks", &mut marks);
+    // ---- links (parallel 8-thread build)
+    let links = links::build_links(&link_files, threads);
+    let links = &links;
+    mark("links", &mut marks);
 
     // ---- events: parse + validate, scatter one RawEv per line by event_id
     let chunks = make_chunks(&event_files, chunk_target(&event_files, threads));
@@ -1286,11 +1243,9 @@ fn main() {
     let oob_slice = &oob_ingest[..];
     par(threads, |_| {
         let mut w = Scatter::new(&ev_set);
-        let zero = PEv { person: Key16::EMPTY, ts: 0, pc: 0 };
-        let mut res = Resolver::new(&ctx.links, zero);
-        let mut emit = |mut e: PEv, person: Key16, phash: u64| {
-            e.person = person;
-            w.push((phash >> (64 - P_BITS)) as usize, e);
+        let mut res = Resolver::new(links, Ev8(0));
+        let mut emit = |e: Ev8, person: Key16, phash: u64| {
+            w.push((phash >> (64 - P_BITS)) as usize, PEv { person, ts: e.ts(), pc: e.pc() });
         };
         let (mut t32, mut t64): (Vec<u32>, Vec<u64>) = (Vec::new(), Vec::new());
         let mut loser: Vec<u64> = Vec::new();
@@ -1317,7 +1272,7 @@ fn main() {
                     if r.ts == TS_INVALID || (loser[me >> 6] >> (me & 63)) & 1 != 0 {
                         continue;
                     }
-                    res.push(PEv { person: Key16::EMPTY, ts: r.ts, pc: r.price }, r.uid, &mut emit);
+                    res.push(Ev8::new(r.ts, r.price), r.uid, &mut emit);
                 }
             }
             segs.free();
@@ -1327,6 +1282,46 @@ fn main() {
     });
     id_set.free_all();
     mark("dedup", &mut marks);
+
+    // ---- clicks: parse, validate, resolve person, scatter by person
+    //      Runs after dedup so click_set reuses 100% pre-faulted 2 MB blocks from id_set!
+    let cws = ws - SEVEN_DAYS_MS;
+    let chunks = make_chunks(&click_files, chunk_target(&click_files, threads));
+    let click_set: ShardSet<Click> = ShardSet::new_shared(P_SHARDS);
+    let next = AtomicUsize::new(0);
+    par(threads, |_| {
+        let mut w = Scatter::new(&click_set);
+        let zero = Cl24 { cid: Key16::EMPTY, ts: 0, camp: 0 };
+        let mut res = Resolver::new(links, zero);
+        let mut emit = |c: Cl24, person: Key16, phash: u64| {
+            w.push((phash >> (64 - P_BITS)) as usize, Click { person, cid: c.cid, phash, ts: c.ts, camp: c.camp });
+        };
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= chunks.len() {
+                break;
+            }
+            let d = chunks[i].data;
+            populate(d);
+            csv::scan::<4, _>(d, |f| {
+                let (cid, uid) = (f[0], f[1]);
+                if cid.is_empty() || uid.is_empty() {
+                    return;
+                }
+                let Some(camp) = ctx.camps.get(f[2]) else { return };
+                let ts = match ctx.dates.parse_ts(f[3]) {
+                    Some(t) if t >= cws && t < ctx.we => t,
+                    _ => return,
+                };
+                let c = Cl24 { cid: Key16::new(cid), ts: (ts - ctx.base) as u32, camp };
+                res.push(c, Key16::new(uid), &mut emit);
+            });
+            release_chunk(d);
+        }
+        res.drain(&mut emit);
+        w.finish();
+    });
+    mark("clicks", &mut marks);
 
     // ---- solve
     let mut order: Vec<(usize, usize)> =

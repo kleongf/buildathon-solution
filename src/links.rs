@@ -116,9 +116,9 @@ struct CEnt {
 
 const CACHE: usize = 128;
 /// Items between the Bloom-word prefetch and the Bloom test.
-const RA: usize = 16;
+const RA: usize = 8;
 /// Items between the table-slot prefetch and the table probe.
-const RB: usize = 32;
+const RB: usize = 16;
 
 type Item<R> = (R, Key16, u64);
 
@@ -469,6 +469,148 @@ pub fn build_links(files: &[&'static [u8]], threads: usize) -> LinkTable {
     LinkTable { tab, rbits, bloom: bloom.into_iter().map(|a| a.into_inner()).collect(), bloom_mask }
 }
 
+/// Fast zero-sync single-threaded link-table builder (retained for reference/tests).
+#[allow(dead_code)]
+pub fn build_links_single(files: &[&'static [u8]]) -> LinkTable {
+    let total_bytes: usize = files.iter().map(|d| d.len()).sum();
+    let est = (total_bytes / 18).max(64);
+    let mut cap = (est * 2).next_power_of_two().max(256);
+    let mut tab: Vec<u32> = vec![0; cap];
+    let mut mask = cap - 1;
+    let mut keys: Vec<Key16> = Vec::with_capacity(est);
+    let mut parent: Vec<u32> = Vec::with_capacity(est);
+
+    #[inline(always)]
+    fn find_seq(parent: &mut [u32], mut x: u32) -> u32 {
+        loop {
+            let p = unsafe { *parent.get_unchecked(x as usize) };
+            if p == x {
+                return x;
+            }
+            let g = unsafe { *parent.get_unchecked(p as usize) };
+            unsafe { *parent.get_unchecked_mut(x as usize) = g };
+            x = g;
+        }
+    }
+
+    #[cold]
+    fn grow(tab: &mut Vec<u32>, cap: &mut usize, mask: &mut usize, keys: &[Key16]) {
+        *cap *= 2;
+        *mask = *cap - 1;
+        tab.clear();
+        tab.resize(*cap, 0);
+        let m = *mask;
+        for (id, k) in keys.iter().enumerate() {
+            let mut i = k.hash(SEED_L) as usize & m;
+            while unsafe { *tab.get_unchecked(i) } != 0 {
+                i = (i + 1) & m;
+            }
+            unsafe { *tab.get_unchecked_mut(i) = id as u32 + 1 };
+        }
+    }
+
+    for &d in files {
+        let start = match d.iter().position(|&c| c == b'\n') {
+            Some(i) => i + 1,
+            None => continue,
+        };
+        let body = &d[start..];
+        if body.is_empty() {
+            continue;
+        }
+        populate(body);
+        csv::scan::<2, _>(body, |f| {
+            let (fa, fb) = (f[0], f[1]);
+            if fa.is_empty() || fb.is_empty() {
+                return;
+            }
+            let mut intern = |k: Key16| -> u32 {
+                if keys.len() * 2 >= cap {
+                    grow(&mut tab, &mut cap, &mut mask, &keys);
+                }
+                let mut i = k.hash(SEED_L) as usize & mask;
+                loop {
+                    let e = unsafe { *tab.get_unchecked(i) };
+                    if e == 0 {
+                        let id = keys.len() as u32;
+                        keys.push(k);
+                        parent.push(id);
+                        unsafe { *tab.get_unchecked_mut(i) = id + 1 };
+                        return id;
+                    }
+                    let id = e - 1;
+                    if unsafe { *keys.get_unchecked(id as usize) } == k {
+                        return id;
+                    }
+                    i = (i + 1) & mask;
+                }
+            };
+            let ia = intern(Key16::new(fa));
+            let ib = intern(Key16::new(fb));
+            let a = find_seq(&mut parent, ia);
+            let b = find_seq(&mut parent, ib);
+            if a != b {
+                if keys[a as usize].cmp_bytes(&keys[b as usize]) == std::cmp::Ordering::Less {
+                    unsafe { *parent.get_unchecked_mut(b as usize) = a };
+                } else {
+                    unsafe { *parent.get_unchecked_mut(a as usize) = b };
+                }
+            }
+        });
+        release_chunk(body);
+    }
+    drop(tab);
+
+    let n = keys.len();
+    let mut counts = [0usize; REGIONS];
+    let mut non_roots: Vec<(u32, u32, u64)> = Vec::with_capacity(n / 2 + 16);
+    for x in 0..n {
+        let r = find_seq(&mut parent, x as u32);
+        if r != x as u32 {
+            let h = unsafe { keys.get_unchecked(x) }.hash(SEED_L);
+            counts[(h >> (64 - REGION_BITS)) as usize] += 1;
+            non_roots.push((x as u32, r, h));
+        }
+    }
+    drop(parent);
+
+    let total_nr = non_roots.len();
+    let bloom_words = ((total_nr * 12 / 64).next_power_of_two()).clamp(1 << 10, 1 << 18);
+    let bloom_mask = bloom_words - 1;
+    let maxc = counts.iter().copied().max().unwrap_or(0);
+    let rbits = ((maxc + maxc / 2 + 1).next_power_of_two().max(4)).trailing_zeros();
+    let mut ltab = vec![LEMPTY; REGIONS << rbits];
+    #[cfg(target_os = "linux")]
+    if ltab.len() * std::mem::size_of::<LEnt>() >= (2 << 20) {
+        unsafe {
+            libc::madvise(
+                ltab.as_mut_ptr() as *mut libc::c_void,
+                ltab.len() * std::mem::size_of::<LEnt>(),
+                libc::MADV_HUGEPAGE,
+            );
+        }
+    }
+    let mut bloom = vec![0u64; bloom_words];
+    let rmask = (1usize << rbits) - 1;
+    let lptr = ltab.as_mut_ptr();
+    for &(x, root, h) in &non_roots {
+        unsafe {
+            *bloom.get_unchecked_mut(bloom_word(h, bloom_mask)) |= bloom_bits(h);
+            let r = (h >> (64 - REGION_BITS)) as usize;
+            let base = r << rbits;
+            let mut i = h as usize & rmask;
+            while (*lptr.add(base + i)).key.lo != 0 {
+                i = (i + 1) & rmask;
+            }
+            *lptr.add(base + i) = LEnt {
+                key: *keys.get_unchecked(x as usize),
+                person: *keys.get_unchecked(root as usize),
+            };
+        }
+    }
+    LinkTable { tab: ltab, rbits, bloom, bloom_mask }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,8 +635,8 @@ mod tests {
         let long_b = "L".repeat(15) + "ab";
         lines.push_str(&format!("{long_a},{long_b}\nM,{long_a}\nq,q\n"));
         let data: &'static [u8] = Box::leak(lines.into_bytes().into_boxed_slice());
-        for threads in [1, 4] {
-            let lt = build_links(&[data], threads);
+        for mode in [0usize, 1, 4] {
+            let lt = if mode == 0 { build_links_single(&[data]) } else { build_links(&[data], mode) };
             for i in 0..1000 {
                 assert_eq!(lt.resolve(Key16::new(format!("n{i:04}").as_bytes())), Key16::new(b"n0000"));
             }
